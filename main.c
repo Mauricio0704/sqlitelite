@@ -1,6 +1,24 @@
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+#define TABLE_MAX_PAGES 100
+#define PAGE_SIZE 4096
+#define size_of_attribute(Struct, Attribute) sizeof(((Struct *)0)->Attribute)
+
+typedef struct {
+  uint32_t id;
+  char username[32];
+  char email[255];
+} Record;
+
+const uint32_t ID_SIZE = size_of_attribute(Record, id);
+const uint32_t USERNAME_SIZE = size_of_attribute(Record, username);
+const uint32_t EMAIL_SIZE = size_of_attribute(Record, email);
+
+const uint32_t RECORD_SIZE = ID_SIZE + USERNAME_SIZE + EMAIL_SIZE;
+const uint32_t RECORDS_PER_PAGE = (PAGE_SIZE / RECORD_SIZE);
 
 typedef struct {
   char *buffer;
@@ -22,27 +40,44 @@ typedef enum {
 typedef enum { STATEMENT_INSERT, STATEMENT_SELECT } StatementType;
 
 typedef struct {
-  int id;
-  char username[32];
-  char email[255];
-} Record;
-
-typedef struct {
   StatementType statement_type;
   Record record_to_insert;
 } Statement;
 
 typedef struct {
-  Record *records;
+  void *pages[TABLE_MAX_PAGES];
   size_t records_length;
 } Table;
 
 Table *new_table() {
-  Table *new_table = malloc(sizeof(Table));
-  new_table->records = NULL;
+  Table *new_table = (Table *)malloc(sizeof(Table));
   new_table->records_length = 0;
 
+  for (uint32_t i = 0; i < TABLE_MAX_PAGES; i++)
+    new_table->pages[i] = NULL;
+
   return new_table;
+}
+
+void free_table(Table *table) {
+  for (uint32_t i = 0; i < TABLE_MAX_PAGES; i++)
+    free(table->pages[i]);
+  free(table);
+}
+
+void *get_record_start(Table *table, uint32_t record_num) {
+  uint32_t page_num = record_num / RECORDS_PER_PAGE;
+  void *page = table->pages[page_num];
+
+  if (page == NULL) {
+    table->pages[page_num] = malloc(PAGE_SIZE);
+    page = table->pages[page_num];
+  }
+
+  uint32_t record_offset = record_num % RECORDS_PER_PAGE;
+  uint32_t byte_offset = RECORD_SIZE * record_offset;
+
+  return page + byte_offset;
 }
 
 InputBuffer *new_input_buffer() {
@@ -109,31 +144,31 @@ void read_input(InputBuffer *input_buffer) {
   input_buffer->buffer[bytes_read - 1] = 0;
 }
 
+void write_serialized_record(Record *source, void *destination) {
+  memcpy(destination + 0, &(source->id), 32);
+  memcpy(destination + 32, &(source->username), USERNAME_SIZE);
+  memcpy(destination + 64, &(source->email), EMAIL_SIZE);
+}
+
+void read_deserialized_record(void *source, Record *destination) {
+  memcpy(&(destination->id), source + 0, 32);
+  memcpy(&(destination->username), source + 32, USERNAME_SIZE);
+  memcpy(&(destination->email), source + 64, EMAIL_SIZE);
+}
+
 void execute_insert(Statement *statement, Table *table) {
-  size_t new_length = table->records_length + 1;
-  table->records = malloc(new_length * sizeof(Record));
+  void *slot = get_record_start(table, table->records_length);
 
-  table->records[table->records_length].id = statement->record_to_insert.id;
-  strncpy(table->records[table->records_length].email,
-          statement->record_to_insert.email,
-          sizeof(table->records[table->records_length].email) - 1);
-  table->records[table->records_length]
-      .email[sizeof(table->records[table->records_length].email) - 1] = '\0';
-
-  strncpy(table->records[table->records_length].username,
-          statement->record_to_insert.username,
-          sizeof(table->records[table->records_length].username) - 1);
-  table->records[table->records_length]
-      .username[sizeof(table->records[table->records_length].username) - 1] =
-      '\0';
-
-  table->records_length = new_length;
+  void *serialized_record;
+  write_serialized_record(&(statement->record_to_insert), slot);
+  table->records_length += 1;
 }
 
 void execute_select(Table *table) {
+  Record record;
   for (int i = 0; i < table->records_length; i++) {
-    Record record = table->records[i];
-    printf("%d | %d %s %s\n", i + 1, record.id, record.username, record.email);
+      read_deserialized_record(get_record_start(table, i),  &record);
+      printf("(%d, %s, %s)\n", record.id, record.username, record.email);
   }
 }
 
