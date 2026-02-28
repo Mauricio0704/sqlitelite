@@ -1,7 +1,10 @@
+#include <fcntl.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 #define TABLE_MAX_PAGES 100
 #define PAGE_SIZE 4096
@@ -46,33 +49,115 @@ typedef struct {
 
 typedef struct {
   void *pages[TABLE_MAX_PAGES];
+  off_t file_length;
+  char *filename;
+  int fd;
+} Pager;
+
+typedef struct {
+  Pager *pager;
   size_t records_length;
 } Table;
 
-Table *new_table() {
-  Table *new_table = (Table *)malloc(sizeof(Table));
-  new_table->records_length = 0;
+Pager *new_pager(char *filename) {
+  int fd = open(filename, O_RDWR | O_CREAT, S_IWUSR | S_IRUSR);
+
+  if (fd == -1) {
+    printf("Unable to open file\n");
+    exit(EXIT_FAILURE);
+  }
+
+  off_t file_length = lseek(fd, 0, SEEK_END);
+
+  Pager *pager = (Pager *)malloc(sizeof(Pager));
+  pager->fd = fd;
+  pager->filename = filename;
+  pager->file_length = file_length;
 
   for (uint32_t i = 0; i < TABLE_MAX_PAGES; i++)
-    new_table->pages[i] = NULL;
+    pager->pages[i] = NULL;
+
+  return pager;
+}
+
+Table *open_db(char *filename) {
+  Pager *pager = new_pager(filename);
+
+  Table *new_table = (Table *)malloc(sizeof(Table));
+  new_table->records_length = 0;
+  new_table->pager = pager;
 
   return new_table;
 }
 
+void flush_page(Pager *pager, uint32_t num_page, size_t size) {
+  if (lseek(pager->fd, num_page * PAGE_SIZE, SEEK_SET) == -1) {
+    printf("Error seeking while flushing page %d\n", num_page);
+    exit(EXIT_FAILURE);
+  }
+
+  ssize_t bytes_written = write(pager->fd, pager->pages[num_page], size);
+  if (bytes_written == -1) {
+    printf("Error writing page %d\n", num_page);
+    exit(EXIT_FAILURE);
+  }
+}
+
+void close_db(Table *table) {
+  Pager *pager = table->pager;
+
+  for (uint32_t i = 0; i < TABLE_MAX_PAGES; i++) {
+    void *page = pager->pages[i];
+
+    if (page == NULL)
+      continue;
+
+    flush_page(pager, i, PAGE_SIZE);
+    free(pager->pages[i]);
+    pager->pages[i] = NULL;
+  }
+}
+
 void free_table(Table *table) {
   for (uint32_t i = 0; i < TABLE_MAX_PAGES; i++)
-    free(table->pages[i]);
+    free(table->pager->pages[i]);
   free(table);
 }
 
-void *get_record_start(Table *table, uint32_t record_num) {
-  uint32_t page_num = record_num / RECORDS_PER_PAGE;
-  void *page = table->pages[page_num];
-
-  if (page == NULL) {
-    table->pages[page_num] = malloc(PAGE_SIZE);
-    page = table->pages[page_num];
+void *get_page(Pager *pager, uint32_t page_num) {
+  if (page_num > TABLE_MAX_PAGES) {
+    printf("Maximum number of pages reached");
+    exit(EXIT_FAILURE);
   }
+
+  if (pager->pages[page_num] == NULL) {
+    // Cache miss.
+    void *page = malloc(PAGE_SIZE);
+    uint32_t num_pages = pager->file_length / PAGE_SIZE;
+
+    if (pager->file_length % PAGE_SIZE) {
+      num_pages += 1;
+    }
+
+    if (page_num <= num_pages) {
+      lseek(pager->fd, page_num * PAGE_SIZE, SEEK_SET);
+      ssize_t bytes_read = read(pager->fd, page, PAGE_SIZE);
+
+      if (bytes_read == -1) {
+        printf("Error reading file\n");
+        exit(EXIT_FAILURE);
+      }
+    }
+    pager->pages[page_num] = page;
+  }
+
+  return pager->pages[page_num];
+}
+
+void *get_record_start(Pager *pager, uint32_t record_num) {
+  uint32_t page_num = record_num / RECORDS_PER_PAGE;
+
+  void *page = get_page(pager, page_num);
 
   uint32_t record_offset = record_num % RECORDS_PER_PAGE;
   uint32_t byte_offset = RECORD_SIZE * record_offset;
@@ -96,10 +181,12 @@ void free_input_buffer(InputBuffer *input_buffer) {
   free(input_buffer);
 }
 
-MetaCommandStatus execute_meta_command(InputBuffer *input_buffer) {
+MetaCommandStatus execute_meta_command(InputBuffer *input_buffer,
+                                       Table *table) {
   if (strcmp(input_buffer->buffer, ".exit") == 0) {
     printf("Closing database\n");
     free_input_buffer(input_buffer);
+    close_db(table);
     exit(EXIT_SUCCESS);
   }
 
@@ -157,8 +244,7 @@ void read_deserialized_record(void *source, Record *destination) {
 }
 
 void execute_insert(Statement *statement, Table *table) {
-  void *slot = get_record_start(table, table->records_length);
-
+  void *slot = get_record_start(table->pager, table->records_length);
   void *serialized_record;
   write_serialized_record(&(statement->record_to_insert), slot);
   table->records_length += 1;
@@ -167,33 +253,37 @@ void execute_insert(Statement *statement, Table *table) {
 void execute_select(Table *table) {
   Record record;
   for (int i = 0; i < table->records_length; i++) {
-      read_deserialized_record(get_record_start(table, i),  &record);
-      printf("(%d, %s, %s)\n", record.id, record.username, record.email);
+    read_deserialized_record(get_record_start(table->pager, i), &record);
+    printf("(%d, %s, %s)\n", record.id, record.username, record.email);
   }
 }
 
 void execute_statement(Statement *statement, Table *table) {
   if (statement->statement_type == STATEMENT_INSERT) {
-    printf("Doing an insert...\n");
     execute_insert(statement, table);
-    printf("Data inserted correctly\n");
   }
   if (statement->statement_type == STATEMENT_SELECT) {
-    printf("Doing a select...\n");
     execute_select(table);
   }
 }
 
 int main(int argc, char *argv[]) {
+  if (argc < 2) {
+    printf("You must supply a db file!\n");
+    exit(EXIT_FAILURE);
+  }
+
   InputBuffer *input_buffer = new_input_buffer();
-  Table *table = new_table();
+
+  char *filename = argv[1];
+  Table *table = open_db(filename);
 
   while (1) {
     print_prompt();
     read_input(input_buffer);
 
     if (input_buffer->buffer[0] == '.') {
-      switch (execute_meta_command(input_buffer)) {
+      switch (execute_meta_command(input_buffer, table)) {
       case META_COMMAND_SUCCESS:
         break;
 
