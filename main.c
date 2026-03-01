@@ -20,6 +20,10 @@ const uint32_t ID_SIZE = size_of_attribute(Record, id);
 const uint32_t USERNAME_SIZE = size_of_attribute(Record, username);
 const uint32_t EMAIL_SIZE = size_of_attribute(Record, email);
 
+const uint32_t ID_OFFSET = 0;
+const uint32_t USERNAME_OFFSET = ID_OFFSET + ID_SIZE;
+const uint32_t EMAIL_OFFSET = USERNAME_OFFSET + USERNAME_SIZE;
+
 const uint32_t RECORD_SIZE = ID_SIZE + USERNAME_SIZE + EMAIL_SIZE;
 const uint32_t RECORDS_PER_PAGE = (PAGE_SIZE / RECORD_SIZE);
 
@@ -84,7 +88,7 @@ Table *open_db(char *filename) {
   Pager *pager = new_pager(filename);
 
   Table *new_table = (Table *)malloc(sizeof(Table));
-  new_table->records_length = 0;
+  new_table->records_length = pager->file_length / RECORD_SIZE;
   new_table->pager = pager;
 
   return new_table;
@@ -106,16 +110,40 @@ void flush_page(Pager *pager, uint32_t num_page, size_t size) {
 void close_db(Table *table) {
   Pager *pager = table->pager;
 
-  for (uint32_t i = 0; i < TABLE_MAX_PAGES; i++) {
-    void *page = pager->pages[i];
+  uint32_t num_full_pages = table->records_length / RECORDS_PER_PAGE;
 
-    if (page == NULL)
+  for (uint32_t i = 0; i < num_full_pages; i++) {
+    if (pager->pages[i] == NULL)
       continue;
 
     flush_page(pager, i, PAGE_SIZE);
     free(pager->pages[i]);
     pager->pages[i] = NULL;
   }
+
+  uint32_t num_additional_records = table->records_length % RECORDS_PER_PAGE;
+  if (num_additional_records > 0) {
+    uint32_t page_num = num_full_pages;
+
+    if (pager->pages[page_num] != NULL) {
+      uint32_t size = num_additional_records * RECORD_SIZE;
+      flush_page(pager, page_num, size);
+      free(pager->pages[page_num]);
+      pager->pages[page_num] = NULL;
+    }
+  }
+
+  for (uint32_t i = 0; i < TABLE_MAX_PAGES; i++) {
+    void *page = pager->pages[i];
+    if (page) {
+      free(page);
+      pager->pages[i] = NULL;
+    }
+  }
+
+  close(pager->fd);
+  free(pager);
+  free(table);
 }
 
 void free_table(Table *table) {
@@ -139,7 +167,7 @@ void *get_page(Pager *pager, uint32_t page_num) {
       num_pages += 1;
     }
 
-    if (page_num <= num_pages) {
+    if (page_num < num_pages) {
       lseek(pager->fd, page_num * PAGE_SIZE, SEEK_SET);
       ssize_t bytes_read = read(pager->fd, page, PAGE_SIZE);
 
@@ -184,7 +212,6 @@ void free_input_buffer(InputBuffer *input_buffer) {
 MetaCommandStatus execute_meta_command(InputBuffer *input_buffer,
                                        Table *table) {
   if (strcmp(input_buffer->buffer, ".exit") == 0) {
-    printf("Closing database\n");
     free_input_buffer(input_buffer);
     close_db(table);
     exit(EXIT_SUCCESS);
@@ -232,27 +259,26 @@ void read_input(InputBuffer *input_buffer) {
 }
 
 void write_serialized_record(Record *source, void *destination) {
-  memcpy(destination + 0, &(source->id), 32);
+  memcpy(destination + 0, &(source->id), ID_SIZE);
   memcpy(destination + 32, &(source->username), USERNAME_SIZE);
   memcpy(destination + 64, &(source->email), EMAIL_SIZE);
 }
 
 void read_deserialized_record(void *source, Record *destination) {
-  memcpy(&(destination->id), source + 0, 32);
+  memcpy(&(destination->id), source + 0, ID_SIZE);
   memcpy(&(destination->username), source + 32, USERNAME_SIZE);
   memcpy(&(destination->email), source + 64, EMAIL_SIZE);
 }
 
 void execute_insert(Statement *statement, Table *table) {
   void *slot = get_record_start(table->pager, table->records_length);
-  void *serialized_record;
   write_serialized_record(&(statement->record_to_insert), slot);
   table->records_length += 1;
 }
 
 void execute_select(Table *table) {
   Record record;
-  for (int i = 0; i < table->records_length; i++) {
+  for (size_t i = 0; i < table->records_length; i++) {
     read_deserialized_record(get_record_start(table->pager, i), &record);
     printf("(%d, %s, %s)\n", record.id, record.username, record.email);
   }
