@@ -61,7 +61,14 @@ typedef struct {
 typedef struct {
   Pager *pager;
   size_t records_length;
+  int is_end_of_table;
 } Table;
+
+typedef struct {
+  size_t record_number;
+  Table *table;
+  int is_end_of_table;
+} Cursor;
 
 Pager *new_pager(char *filename) {
   int fd = open(filename, O_RDWR | O_CREAT, S_IWUSR | S_IRUSR);
@@ -82,16 +89,6 @@ Pager *new_pager(char *filename) {
     pager->pages[i] = NULL;
 
   return pager;
-}
-
-Table *open_db(char *filename) {
-  Pager *pager = new_pager(filename);
-
-  Table *new_table = (Table *)malloc(sizeof(Table));
-  new_table->records_length = pager->file_length / RECORD_SIZE;
-  new_table->pager = pager;
-
-  return new_table;
 }
 
 void flush_page(Pager *pager, uint32_t num_page, size_t size) {
@@ -193,6 +190,33 @@ void *get_record_start(Pager *pager, uint32_t record_num) {
   return page + byte_offset;
 }
 
+Cursor *new_cursor_start(Table *table) {
+  Cursor *new_cursor = (Cursor *)malloc(sizeof(Cursor));
+  new_cursor->record_number = 0;
+  new_cursor->table = table;
+  new_cursor->is_end_of_table = (table->records_length == 0);
+
+  return new_cursor;
+}
+
+Cursor *new_cursor_end(Table *table) {
+  Cursor *new_cursor = (Cursor *)malloc(sizeof(Cursor));
+  new_cursor->record_number = table->records_length;
+  new_cursor->table = table;
+  new_cursor->is_end_of_table = 1;
+
+  return new_cursor;
+}
+
+void advance_cursor(Cursor *cursor) {
+  if (cursor->is_end_of_table) {
+    printf("No more records available\n");
+    exit(EXIT_FAILURE);
+  }
+
+  cursor->record_number += 1;
+}
+
 InputBuffer *new_input_buffer() {
   InputBuffer *new_buffer = malloc(sizeof(InputBuffer));
   new_buffer->buffer = NULL;
@@ -200,6 +224,18 @@ InputBuffer *new_input_buffer() {
   new_buffer->input_length = 0;
 
   return new_buffer;
+}
+
+Cursor *open_db(char *filename) {
+  Pager *pager = new_pager(filename);
+
+  Table *new_table = (Table *)malloc(sizeof(Table));
+  new_table->records_length = pager->file_length / RECORD_SIZE;
+  new_table->pager = pager;
+
+  Cursor *cursor = new_cursor_start(new_table);
+
+  return cursor;
 }
 
 void print_prompt() { printf("db > "); }
@@ -270,26 +306,34 @@ void read_deserialized_record(void *source, Record *destination) {
   memcpy(&(destination->email), source + 64, EMAIL_SIZE);
 }
 
+void access_row(Cursor *cursor) {
+  Record record;
+  read_deserialized_record(
+      get_record_start(cursor->table->pager, cursor->record_number), &record);
+  printf("(%d, %s, %s)\n", record.id, record.username, record.email);
+}
+
 void execute_insert(Statement *statement, Table *table) {
   void *slot = get_record_start(table->pager, table->records_length);
   write_serialized_record(&(statement->record_to_insert), slot);
   table->records_length += 1;
 }
 
-void execute_select(Table *table) {
+void execute_select(Cursor *cursor) {
+  cursor->record_number = 0;
   Record record;
-  for (size_t i = 0; i < table->records_length; i++) {
-    read_deserialized_record(get_record_start(table->pager, i), &record);
-    printf("(%d, %s, %s)\n", record.id, record.username, record.email);
+  for (size_t i = 0; i < cursor->table->records_length; i++) {
+    access_row(cursor);
+    advance_cursor(cursor);
   }
 }
 
-void execute_statement(Statement *statement, Table *table) {
+void execute_statement(Statement *statement, Cursor *cursor) {
   if (statement->statement_type == STATEMENT_INSERT) {
-    execute_insert(statement, table);
+    execute_insert(statement, cursor->table);
   }
   if (statement->statement_type == STATEMENT_SELECT) {
-    execute_select(table);
+    execute_select(cursor);
   }
 }
 
@@ -302,14 +346,14 @@ int main(int argc, char *argv[]) {
   InputBuffer *input_buffer = new_input_buffer();
 
   char *filename = argv[1];
-  Table *table = open_db(filename);
+  Cursor *cursor = open_db(filename);
 
   while (1) {
     print_prompt();
     read_input(input_buffer);
 
     if (input_buffer->buffer[0] == '.') {
-      switch (execute_meta_command(input_buffer, table)) {
+      switch (execute_meta_command(input_buffer, cursor->table)) {
       case META_COMMAND_SUCCESS:
         break;
 
@@ -334,7 +378,7 @@ int main(int argc, char *argv[]) {
       break;
     }
 
-    execute_statement(&statement, table);
+    execute_statement(&statement, cursor);
     printf("Executed\n");
   }
 }
