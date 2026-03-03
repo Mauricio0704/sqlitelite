@@ -61,7 +61,6 @@ typedef struct {
 typedef struct {
   Pager *pager;
   size_t records_length;
-  int is_end_of_table;
 } Table;
 
 typedef struct {
@@ -179,10 +178,11 @@ void *get_page(Pager *pager, uint32_t page_num) {
   return pager->pages[page_num];
 }
 
-void *get_record_start(Pager *pager, uint32_t record_num) {
+void *get_record_start(Cursor *cursor) {
+  uint32_t record_num = cursor->record_number;
   uint32_t page_num = record_num / RECORDS_PER_PAGE;
 
-  void *page = get_page(pager, page_num);
+  void *page = get_page(cursor->table->pager, page_num);
 
   uint32_t record_offset = record_num % RECORDS_PER_PAGE;
   uint32_t byte_offset = RECORD_SIZE * record_offset;
@@ -209,12 +209,11 @@ Cursor *new_cursor_end(Table *table) {
 }
 
 void advance_cursor(Cursor *cursor) {
-  if (cursor->is_end_of_table) {
-    printf("No more records available\n");
-    exit(EXIT_FAILURE);
-  }
-
   cursor->record_number += 1;
+
+  if (cursor->record_number == cursor->table->records_length) {
+    cursor->is_end_of_table = 1;
+  }
 }
 
 InputBuffer *new_input_buffer() {
@@ -226,16 +225,14 @@ InputBuffer *new_input_buffer() {
   return new_buffer;
 }
 
-Cursor *open_db(char *filename) {
+Table *open_db(char *filename) {
   Pager *pager = new_pager(filename);
 
   Table *new_table = (Table *)malloc(sizeof(Table));
   new_table->records_length = pager->file_length / RECORD_SIZE;
   new_table->pager = pager;
 
-  Cursor *cursor = new_cursor_start(new_table);
-
-  return cursor;
+  return new_table;
 }
 
 void print_prompt() { printf("db > "); }
@@ -308,32 +305,38 @@ void read_deserialized_record(void *source, Record *destination) {
 
 void access_row(Cursor *cursor) {
   Record record;
-  read_deserialized_record(
-      get_record_start(cursor->table->pager, cursor->record_number), &record);
+  read_deserialized_record(get_record_start(cursor), &record);
   printf("(%d, %s, %s)\n", record.id, record.username, record.email);
 }
 
 void execute_insert(Statement *statement, Table *table) {
-  void *slot = get_record_start(table->pager, table->records_length);
+  Cursor *cursor = new_cursor_end(table);
+
+  void *slot = get_record_start(cursor);
   write_serialized_record(&(statement->record_to_insert), slot);
   table->records_length += 1;
+  
+  free(cursor);
 }
 
-void execute_select(Cursor *cursor) {
-  cursor->record_number = 0;
+void execute_select(Statement *statement, Table *table) {
+  Cursor *cursor = new_cursor_start(table);
   Record record;
-  for (size_t i = 0; i < cursor->table->records_length; i++) {
+
+  while (!(cursor->is_end_of_table)) {
     access_row(cursor);
     advance_cursor(cursor);
   }
+
+  free(cursor);
 }
 
-void execute_statement(Statement *statement, Cursor *cursor) {
+void execute_statement(Statement *statement, Table *table) {
   if (statement->statement_type == STATEMENT_INSERT) {
-    execute_insert(statement, cursor->table);
+    execute_insert(statement, table);
   }
   if (statement->statement_type == STATEMENT_SELECT) {
-    execute_select(cursor);
+    execute_select(statement, table);
   }
 }
 
@@ -346,14 +349,14 @@ int main(int argc, char *argv[]) {
   InputBuffer *input_buffer = new_input_buffer();
 
   char *filename = argv[1];
-  Cursor *cursor = open_db(filename);
+  Table *table = open_db(filename);
 
   while (1) {
     print_prompt();
     read_input(input_buffer);
 
     if (input_buffer->buffer[0] == '.') {
-      switch (execute_meta_command(input_buffer, cursor->table)) {
+      switch (execute_meta_command(input_buffer, table)) {
       case META_COMMAND_SUCCESS:
         break;
 
@@ -378,7 +381,7 @@ int main(int argc, char *argv[]) {
       break;
     }
 
-    execute_statement(&statement, cursor);
+    execute_statement(&statement, table);
     printf("Executed\n");
   }
 }
