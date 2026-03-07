@@ -73,7 +73,11 @@ typedef struct {
 
 // Leaf node header
 const uint32_t LEAF_NODE_NUM_CELLS_SIZE = sizeof(uint32_t);
-const uint32_t LEAF_NODE_HEADER_SIZE = LEAF_NODE_NUM_CELLS_SIZE;
+const uint16_t LEAF_NODE_FREE_START_SIZE = sizeof(uint16_t);
+const uint16_t LEAF_NODE_FREE_END_SIZE = sizeof(uint16_t);
+const uint32_t LEAF_NODE_HEADER_SIZE = LEAF_NODE_NUM_CELLS_SIZE +
+                                       LEAF_NODE_FREE_END_SIZE +
+                                       LEAF_NODE_FREE_START_SIZE;
 
 // Leaf node body
 const uint16_t LEAF_NODE_OFFSET_SIZE = sizeof(uint16_t);
@@ -88,6 +92,14 @@ const uint32_t LEAF_NODE_MAX_CELLS =
     LEAF_NODE_SPACE_FOR_CELLS / LEAF_NODE_CELL_SIZE;
 
 uint32_t *leaf_node_num_cells(void *node) { return node; }
+
+uint16_t *leaf_node_free_start(void *node) {
+  return node + LEAF_NODE_NUM_CELLS_SIZE;
+}
+
+uint16_t *leaf_node_free_end(void *node) {
+  return node + LEAF_NODE_NUM_CELLS_SIZE + LEAF_NODE_FREE_START_SIZE;
+}
 
 void *leaf_node_cell(void *node, uint32_t cell_num) {
   return node + LEAF_NODE_HEADER_SIZE + cell_num * LEAF_NODE_CELL_SIZE;
@@ -208,11 +220,8 @@ void *get_page(Pager *pager, uint32_t page_num) {
 void *get_record_start(Cursor *cursor) {
   void *node = get_page(cursor->table->pager, cursor->page_num);
 
-  uint32_t cell_offset = LEAF_NODE_HEADER_SIZE +
-                         cursor->cell_num * LEAF_NODE_CELL_SIZE +
-                         LEAF_NODE_CELL_KEY_SIZE;
-
-  return node + cell_offset;
+  return node + *leaf_node_offset_value(node, cursor->cell_num) +
+         LEAF_NODE_CELL_KEY_SIZE;
 }
 
 Cursor *new_cursor_start(Table *table) {
@@ -239,16 +248,14 @@ Cursor *new_cursor_end(Table *table) {
 }
 
 void advance_cursor(Cursor *cursor) {
+  void *node = get_page(cursor->table->pager, cursor->page_num);
   cursor->cell_num += 1;
 
-  if (cursor->cell_num >= LEAF_NODE_MAX_CELLS) {
-    printf("Maximum insertions achieved\n");
-    return;
-  } else {
-    if (cursor->cell_num == LEAF_NODE_MAX_CELLS - 1) {
-      cursor->is_end_of_table = 1;
-    }
+  if (cursor->cell_num >= *leaf_node_num_cells(node)) {
+    cursor->is_end_of_table = 1;
   }
+  
+  return;
 }
 
 InputBuffer *new_input_buffer() {
@@ -260,7 +267,13 @@ InputBuffer *new_input_buffer() {
   return new_buffer;
 }
 
-void initialize_leaf_node(void *node) { *leaf_node_num_cells(node) = 0; }
+void initialize_leaf_node(void *node) {
+  *leaf_node_num_cells(node) = 0;
+  *leaf_node_free_start(node) =
+      LEAF_NODE_HEADER_SIZE +
+      *leaf_node_num_cells(node) * LEAF_NODE_OFFSET_SIZE;
+  *leaf_node_free_end(node) = LEAF_NODE_SIZE;
+}
 
 Cursor *leaf_node_find(Table *table, uint32_t page_num, uint32_t key) {
   void *node = get_page(table->pager, page_num);
@@ -379,16 +392,23 @@ void read_deserialized_record(void *source, Record *destination) {
 void leaf_node_insert(Cursor *cursor, uint32_t key, Record *record) {
   void *node = get_page(cursor->table->pager, cursor->page_num);
 
+  if (*leaf_node_free_end(node) - LEAF_NODE_CELL_SIZE <=
+      *leaf_node_free_start(node) + LEAF_NODE_OFFSET_SIZE) {
+    printf("Maximum number of insertions reached\n");
+    exit(EXIT_FAILURE);
+  }
+
   uint32_t num_cells = *leaf_node_num_cells(node);
-  uint32_t insertion_point = LEAF_NODE_MAX_CELLS - 1 - num_cells;
+  uint32_t insertion_point = *leaf_node_free_end(node) - LEAF_NODE_CELL_SIZE;
 
   *(leaf_node_num_cells(node)) += 1;
-  uint8_t *node_bytes = (uint8_t *)node;
-  uint8_t *cell_bytes = (uint8_t *)leaf_node_cell(node, insertion_point);
+  *(leaf_node_free_start(node)) += LEAF_NODE_OFFSET_SIZE;
+  *(leaf_node_free_end(node)) -= LEAF_NODE_CELL_SIZE;
 
-  *(leaf_node_offset_value(node, num_cells)) = cell_bytes - node_bytes;
-  *(leaf_node_cell_key(node, insertion_point)) = key;
-  write_serialized_record(record, leaf_node_cell_value(node, insertion_point));
+  *(leaf_node_offset_value(node, num_cells)) = insertion_point;
+  uint8_t *cell = (uint8_t *)node + insertion_point;
+  *(uint32_t *)cell = key;
+  write_serialized_record(record, cell + LEAF_NODE_CELL_KEY_SIZE);
 }
 
 void access_row(Cursor *cursor) {
