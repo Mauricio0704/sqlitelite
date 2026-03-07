@@ -66,7 +66,7 @@ typedef struct {
 
 typedef struct {
   uint32_t page_num;
-  uint32_t cell_num;
+  uint32_t slot_num;
   Table *table;
   int is_end_of_table;
 } Cursor;
@@ -101,21 +101,16 @@ uint16_t *leaf_node_free_end(void *node) {
   return node + LEAF_NODE_NUM_CELLS_SIZE + LEAF_NODE_FREE_START_SIZE;
 }
 
-void *leaf_node_cell(void *node, uint32_t cell_num) {
-  return node + LEAF_NODE_HEADER_SIZE + cell_num * LEAF_NODE_CELL_SIZE;
-}
-
-uint32_t *leaf_node_cell_key(void *node, uint32_t cell_num) {
-  return leaf_node_cell(node, cell_num);
-}
-
-void *leaf_node_cell_value(void *node, uint32_t cell_num) {
-  return leaf_node_cell(node, cell_num) + LEAF_NODE_CELL_KEY_SIZE;
-}
-
-uint16_t *leaf_node_offset_value(void *node, uint16_t offset_num) {
-  return node + LEAF_NODE_HEADER_SIZE + offset_num * LEAF_NODE_OFFSET_SIZE;
+uint16_t *leaf_node_offset_value(void *node, uint16_t slot_num) {
+  return node + LEAF_NODE_HEADER_SIZE + slot_num * LEAF_NODE_OFFSET_SIZE;
 };
+
+uint32_t leaf_node_key_at_slot(void *node, uint32_t slot_num) {
+  uint16_t cell_offset = *leaf_node_offset_value(node, (uint16_t)slot_num);
+  uint32_t key;
+  memcpy(&key, (uint8_t *)node + cell_offset, sizeof(key));
+  return key;
+}
 
 typedef struct {
   Pager *pager;
@@ -220,14 +215,14 @@ void *get_page(Pager *pager, uint32_t page_num) {
 void *get_record_start(Cursor *cursor) {
   void *node = get_page(cursor->table->pager, cursor->page_num);
 
-  return node + *leaf_node_offset_value(node, cursor->cell_num) +
+  return node + *leaf_node_offset_value(node, cursor->slot_num) +
          LEAF_NODE_CELL_KEY_SIZE;
 }
 
 Cursor *new_cursor_start(Table *table) {
   Cursor *new_cursor = (Cursor *)malloc(sizeof(Cursor));
   new_cursor->page_num = table->root_page_num;
-  new_cursor->cell_num = 0;
+  new_cursor->slot_num = 0;
   new_cursor->table = table;
   void *node = get_page(table->pager, new_cursor->page_num);
   uint32_t num_cells = *leaf_node_num_cells(node);
@@ -240,7 +235,7 @@ Cursor *new_cursor_end(Table *table) {
   Cursor *new_cursor = (Cursor *)malloc(sizeof(Cursor));
   new_cursor->page_num = table->pager->num_pages - 1;
   void *node = get_page(table->pager, table->pager->num_pages - 1);
-  new_cursor->cell_num = *leaf_node_num_cells(node);
+  new_cursor->slot_num = *leaf_node_num_cells(node);
   new_cursor->table = table;
   new_cursor->is_end_of_table = 1;
 
@@ -249,12 +244,12 @@ Cursor *new_cursor_end(Table *table) {
 
 void advance_cursor(Cursor *cursor) {
   void *node = get_page(cursor->table->pager, cursor->page_num);
-  cursor->cell_num += 1;
+  cursor->slot_num += 1;
 
-  if (cursor->cell_num >= *leaf_node_num_cells(node)) {
+  if (cursor->slot_num >= *leaf_node_num_cells(node)) {
     cursor->is_end_of_table = 1;
   }
-  
+
   return;
 }
 
@@ -275,9 +270,8 @@ void initialize_leaf_node(void *node) {
   *leaf_node_free_end(node) = LEAF_NODE_SIZE;
 }
 
-Cursor *leaf_node_find(Table *table, uint32_t page_num, uint32_t key) {
+Cursor *leaf_node_offset_find(Table *table, uint32_t page_num, uint32_t key) {
   void *node = get_page(table->pager, page_num);
-
   Cursor *cursor = (Cursor *)malloc(sizeof(Cursor));
   cursor->page_num = page_num;
   cursor->table = table;
@@ -287,10 +281,10 @@ Cursor *leaf_node_find(Table *table, uint32_t page_num, uint32_t key) {
 
   while (left < right) {
     uint32_t middle = left + (right - left) / 2;
-    uint32_t curr_key = *leaf_node_cell_key(node, middle);
+    uint32_t curr_key = leaf_node_key_at_slot(node, middle);
 
     if (key == curr_key) {
-      cursor->cell_num = middle;
+      cursor->slot_num = middle;
       return cursor;
     }
     if (key < curr_key) {
@@ -300,7 +294,7 @@ Cursor *leaf_node_find(Table *table, uint32_t page_num, uint32_t key) {
     }
   }
 
-  cursor->cell_num = left;
+  cursor->slot_num = left;
   return cursor;
 }
 
@@ -399,13 +393,20 @@ void leaf_node_insert(Cursor *cursor, uint32_t key, Record *record) {
   }
 
   uint32_t num_cells = *leaf_node_num_cells(node);
+  uint32_t slot_index = cursor->slot_num;
+
   uint32_t insertion_point = *leaf_node_free_end(node) - LEAF_NODE_CELL_SIZE;
+
+  for (uint32_t i = num_cells; i > slot_index; i--) {
+    *leaf_node_offset_value(node, (uint16_t)i) =
+        *leaf_node_offset_value(node, (uint16_t)(i - 1));
+  }
+  *(leaf_node_offset_value(node, slot_index)) = insertion_point;
 
   *(leaf_node_num_cells(node)) += 1;
   *(leaf_node_free_start(node)) += LEAF_NODE_OFFSET_SIZE;
   *(leaf_node_free_end(node)) -= LEAF_NODE_CELL_SIZE;
 
-  *(leaf_node_offset_value(node, num_cells)) = insertion_point;
   uint8_t *cell = (uint8_t *)node + insertion_point;
   *(uint32_t *)cell = key;
   write_serialized_record(record, cell + LEAF_NODE_CELL_KEY_SIZE);
@@ -418,9 +419,9 @@ void access_row(Cursor *cursor) {
 }
 
 void execute_insert(Statement *statement, Table *table) {
-  Cursor *cursor = new_cursor_end(table);
-  void *node = get_page(table->pager, table->pager->num_pages - 1);
   Record record = statement->record_to_insert;
+  Cursor *cursor =
+      leaf_node_offset_find(table, table->pager->num_pages - 1, record.id);
 
   leaf_node_insert(cursor, record.id, &record);
 
