@@ -76,6 +76,7 @@ const uint32_t LEAF_NODE_NUM_CELLS_SIZE = sizeof(uint32_t);
 const uint32_t LEAF_NODE_HEADER_SIZE = LEAF_NODE_NUM_CELLS_SIZE;
 
 // Leaf node body
+const uint16_t LEAF_NODE_OFFSET_SIZE = sizeof(uint16_t);
 const uint32_t LEAF_NODE_SIZE = PAGE_SIZE;
 const uint32_t LEAF_NODE_CELL_KEY_SIZE = sizeof(uint32_t);
 const uint32_t LEAF_NODE_CELL_VALUE_SIZE = RECORD_SIZE;
@@ -99,6 +100,10 @@ uint32_t *leaf_node_cell_key(void *node, uint32_t cell_num) {
 void *leaf_node_cell_value(void *node, uint32_t cell_num) {
   return leaf_node_cell(node, cell_num) + LEAF_NODE_CELL_KEY_SIZE;
 }
+
+uint16_t *leaf_node_offset_value(void *node, uint16_t offset_num) {
+  return node + LEAF_NODE_HEADER_SIZE + offset_num * LEAF_NODE_OFFSET_SIZE;
+};
 
 typedef struct {
   Pager *pager;
@@ -375,18 +380,15 @@ void leaf_node_insert(Cursor *cursor, uint32_t key, Record *record) {
   void *node = get_page(cursor->table->pager, cursor->page_num);
 
   uint32_t num_cells = *leaf_node_num_cells(node);
-
-  if (cursor->cell_num < num_cells) {
-    // Make room for new cell
-    for (uint32_t i = num_cells; i > cursor->cell_num; i--) {
-      memcpy(leaf_node_cell(node, i), leaf_node_cell(node, i - 1),
-             LEAF_NODE_CELL_SIZE);
-    }
-  }
+  uint32_t insertion_point = LEAF_NODE_MAX_CELLS - 1 - num_cells;
 
   *(leaf_node_num_cells(node)) += 1;
-  *(leaf_node_cell_key(node, cursor->cell_num)) = key;
-  write_serialized_record(record, leaf_node_cell_value(node, cursor->cell_num));
+  uint8_t *node_bytes = (uint8_t *)node;
+  uint8_t *cell_bytes = (uint8_t *)leaf_node_cell(node, insertion_point);
+
+  *(leaf_node_offset_value(node, num_cells)) = cell_bytes - node_bytes;
+  *(leaf_node_cell_key(node, insertion_point)) = key;
+  write_serialized_record(record, leaf_node_cell_value(node, insertion_point));
 }
 
 void access_row(Cursor *cursor) {
