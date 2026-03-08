@@ -44,6 +44,12 @@ typedef enum {
   META_COMMAND_UNRECOGNIZED_COMMAND
 } MetaCommandStatus;
 
+typedef enum {
+  NODE_TYPE_INTERNAL,
+  NODE_TYPE_LEAF,
+  NODE_TYPE_INDEFINITE
+} NodeType;
+
 typedef enum { STATEMENT_INSERT, STATEMENT_SELECT } StatementType;
 
 typedef struct {
@@ -71,19 +77,42 @@ typedef struct {
   int is_end_of_table;
 } Cursor;
 
+const uint8_t NODE_IS_ROOT_SIZE = sizeof(uint8_t);
+const uint32_t NODE_IS_ROOT_OFFSET = 0;
+const uint8_t NODE_TYPE_SIZE = sizeof(uint8_t);
+const uint32_t NODE_TYPE_OFFSET = NODE_IS_ROOT_OFFSET + NODE_IS_ROOT_SIZE;
+const uint32_t NODE_PARENT_POINTER_SIZE = sizeof(uint32_t);
+const uint32_t NODE_PARENT_POINTER_OFFSET =
+    NODE_TYPE_OFFSET + NODE_TYPE_SIZE;
+const uint32_t COMMON_NODE_HEADER_SIZE =
+    NODE_IS_ROOT_SIZE + NODE_TYPE_SIZE + NODE_PARENT_POINTER_SIZE;
+
+// Internal node header
+const uint32_t INTERNAL_NODE_NUM_KEYS_SIZE = sizeof(uint32_t);
+const uint32_t INTERNAL_NODE_HEADER_SIZE =
+    COMMON_NODE_HEADER_SIZE + INTERNAL_NODE_NUM_KEYS_SIZE;
+
 // Leaf node header
 const uint32_t LEAF_NODE_NUM_CELLS_SIZE = sizeof(uint32_t);
+const uint32_t LEAF_NODE_NUM_CELLS_OFFSET = COMMON_NODE_HEADER_SIZE;
 const uint16_t LEAF_NODE_FREE_START_SIZE = sizeof(uint16_t);
+const uint32_t LEAF_NODE_FREE_START_OFFSET =
+    LEAF_NODE_NUM_CELLS_OFFSET + LEAF_NODE_NUM_CELLS_SIZE;
 const uint16_t LEAF_NODE_FREE_END_SIZE = sizeof(uint16_t);
-const uint32_t LEAF_NODE_HEADER_SIZE = LEAF_NODE_NUM_CELLS_SIZE +
-                                       LEAF_NODE_FREE_END_SIZE +
-                                       LEAF_NODE_FREE_START_SIZE;
+const uint32_t LEAF_NODE_FREE_END_OFFSET =
+    LEAF_NODE_FREE_START_OFFSET + LEAF_NODE_FREE_START_SIZE;
+const uint32_t LEAF_NODE_HEADER_SIZE =
+    COMMON_NODE_HEADER_SIZE + LEAF_NODE_NUM_CELLS_SIZE +
+    LEAF_NODE_FREE_START_SIZE + LEAF_NODE_FREE_END_SIZE;
 
-// Leaf node body
-const uint16_t LEAF_NODE_OFFSET_SIZE = sizeof(uint16_t);
 const uint32_t LEAF_NODE_SIZE = PAGE_SIZE;
+// Leaf node body
+const uint16_t LEAF_NODE_SLOT_SIZE = sizeof(uint16_t);
 const uint32_t LEAF_NODE_CELL_KEY_SIZE = sizeof(uint32_t);
+const uint32_t LEAF_NODE_CELL_KEY_OFFSET = 0;
 const uint32_t LEAF_NODE_CELL_VALUE_SIZE = RECORD_SIZE;
+const uint32_t LEAF_NODE_CELL_VALUE_OFFSET =
+    LEAF_NODE_CELL_KEY_OFFSET + LEAF_NODE_CELL_KEY_SIZE;
 const uint32_t LEAF_NODE_SPACE_FOR_CELLS =
     LEAF_NODE_SIZE - LEAF_NODE_HEADER_SIZE;
 const uint32_t LEAF_NODE_CELL_SIZE =
@@ -91,18 +120,26 @@ const uint32_t LEAF_NODE_CELL_SIZE =
 const uint32_t LEAF_NODE_MAX_CELLS =
     LEAF_NODE_SPACE_FOR_CELLS / LEAF_NODE_CELL_SIZE;
 
-uint32_t *leaf_node_num_cells(void *node) { return node; }
+uint8_t *node_is_root_value(void *node) { return node + NODE_IS_ROOT_OFFSET; }
+
+uint8_t *node_type_value(void *node) { return node + NODE_TYPE_OFFSET; }
+
+uint32_t *node_parent(void *node) { return node + NODE_PARENT_POINTER_OFFSET; }
+
+uint32_t *leaf_node_num_cells(void *node) {
+  return node + LEAF_NODE_NUM_CELLS_OFFSET;
+}
 
 uint16_t *leaf_node_free_start(void *node) {
-  return node + LEAF_NODE_NUM_CELLS_SIZE;
+  return node + LEAF_NODE_FREE_START_OFFSET;
 }
 
 uint16_t *leaf_node_free_end(void *node) {
-  return node + LEAF_NODE_NUM_CELLS_SIZE + LEAF_NODE_FREE_START_SIZE;
+  return node + LEAF_NODE_FREE_END_OFFSET;
 }
 
 uint16_t *leaf_node_offset_value(void *node, uint16_t slot_num) {
-  return node + LEAF_NODE_HEADER_SIZE + slot_num * LEAF_NODE_OFFSET_SIZE;
+  return node + LEAF_NODE_HEADER_SIZE + slot_num * LEAF_NODE_SLOT_SIZE;
 };
 
 uint32_t leaf_node_key_at_slot(void *node, uint32_t slot_num) {
@@ -176,12 +213,6 @@ void close_db(Table *table) {
   free(table);
 }
 
-void free_table(Table *table) {
-  for (uint32_t i = 0; i < TABLE_MAX_PAGES; i++)
-    free(table->pager->pages[i]);
-  free(table);
-}
-
 void *get_page(Pager *pager, uint32_t page_num) {
   if (page_num >= TABLE_MAX_PAGES) {
     printf("Maximum number of pages reached");
@@ -231,17 +262,6 @@ Cursor *new_cursor_start(Table *table) {
   return new_cursor;
 }
 
-Cursor *new_cursor_end(Table *table) {
-  Cursor *new_cursor = (Cursor *)malloc(sizeof(Cursor));
-  new_cursor->page_num = table->pager->num_pages - 1;
-  void *node = get_page(table->pager, table->pager->num_pages - 1);
-  new_cursor->slot_num = *leaf_node_num_cells(node);
-  new_cursor->table = table;
-  new_cursor->is_end_of_table = 1;
-
-  return new_cursor;
-}
-
 void advance_cursor(Cursor *cursor) {
   void *node = get_page(cursor->table->pager, cursor->page_num);
   cursor->slot_num += 1;
@@ -262,11 +282,17 @@ InputBuffer *new_input_buffer() {
   return new_buffer;
 }
 
+void initialize_node(void *node, NodeType node_type) {
+  *node_is_root_value(node) = 0;
+  *node_type_value(node) = node_type;
+  *node_parent(node) = 0;
+}
+
 void initialize_leaf_node(void *node) {
+  initialize_node(node, NODE_TYPE_LEAF);
   *leaf_node_num_cells(node) = 0;
   *leaf_node_free_start(node) =
-      LEAF_NODE_HEADER_SIZE +
-      *leaf_node_num_cells(node) * LEAF_NODE_OFFSET_SIZE;
+      LEAF_NODE_HEADER_SIZE + *leaf_node_num_cells(node) * LEAF_NODE_SLOT_SIZE;
   *leaf_node_free_end(node) = LEAF_NODE_SIZE;
 }
 
@@ -308,6 +334,7 @@ Table *open_db(char *filename) {
   if (pager->num_pages == 0) {
     void *root_node = get_page(pager, 0);
     initialize_leaf_node(root_node);
+    *node_is_root_value(root_node) = 1;
   }
 
   new_table->pager->num_pages = 1;
@@ -387,7 +414,7 @@ void leaf_node_insert(Cursor *cursor, uint32_t key, Record *record) {
   void *node = get_page(cursor->table->pager, cursor->page_num);
 
   if (*leaf_node_free_end(node) - LEAF_NODE_CELL_SIZE <=
-      *leaf_node_free_start(node) + LEAF_NODE_OFFSET_SIZE) {
+      *leaf_node_free_start(node) + LEAF_NODE_SLOT_SIZE) {
     printf("Maximum number of insertions reached\n");
     exit(EXIT_FAILURE);
   }
@@ -404,7 +431,7 @@ void leaf_node_insert(Cursor *cursor, uint32_t key, Record *record) {
   *(leaf_node_offset_value(node, slot_index)) = insertion_point;
 
   *(leaf_node_num_cells(node)) += 1;
-  *(leaf_node_free_start(node)) += LEAF_NODE_OFFSET_SIZE;
+  *(leaf_node_free_start(node)) += LEAF_NODE_SLOT_SIZE;
   *(leaf_node_free_end(node)) -= LEAF_NODE_CELL_SIZE;
 
   uint8_t *cell = (uint8_t *)node + insertion_point;
