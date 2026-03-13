@@ -452,16 +452,12 @@ void read_deserialized_record(void *source, Record *destination) {
 void leaf_node_insert(Cursor *cursor, uint32_t key, Record *record);
 
 void leaf_node_split(Cursor *cursor, void *node, uint32_t key, Record *record) {
-  // For now suppose node is always root.
-  if (!(*node_is_root_value(node))) {
-    printf("Non-root split is not implemented yet\n");
-    exit(EXIT_FAILURE);
-  }
-
   uint32_t old_num_cells = *leaf_node_num_cells(node);
   uint32_t total_cells = old_num_cells + 1;
   uint32_t insertion_slot = cursor->slot_num;
   const uint32_t SPLIT_POINT = (total_cells + 1) / 2;
+  uint8_t was_root = *node_is_root_value(node);
+  uint32_t old_parent_page_num = *node_parent(node);
 
   uint32_t all_keys[LEAF_NODE_MAX_CELLS + 1];
   Record all_records[LEAF_NODE_MAX_CELLS + 1];
@@ -482,13 +478,25 @@ void leaf_node_split(Cursor *cursor, void *node, uint32_t key, Record *record) {
   }
 
   Pager *pager = cursor->table->pager;
-  uint32_t root_page_num = cursor->page_num;
-  uint32_t left_page_num = pager->num_pages;
-  uint32_t right_page_num = pager->num_pages + 1;
-  pager->num_pages += 2;
+  uint32_t left_page_num;
+  uint32_t right_page_num;
+  void *left_page;
+  void *right_page;
 
-  void *left_page = get_page(pager, left_page_num);
-  void *right_page = get_page(pager, right_page_num);
+  if (!was_root) {
+    left_page_num = cursor->page_num;
+    right_page_num = pager->num_pages;
+    pager->num_pages += 1;
+
+    left_page = node;
+  } else {
+    left_page_num = pager->num_pages;
+    right_page_num = pager->num_pages + 1;
+    pager->num_pages += 2;
+
+    left_page = get_page(pager, left_page_num);
+  }
+  right_page = get_page(pager, right_page_num);
   initialize_leaf_node(left_page);
   initialize_leaf_node(right_page);
 
@@ -516,16 +524,32 @@ void leaf_node_split(Cursor *cursor, void *node, uint32_t key, Record *record) {
     }
   }
 
-  *node_parent(left_page) = root_page_num;
-  *node_parent(right_page) = root_page_num;
+  if (!was_root) {
+    // For now suppose the parent is always the root node.
+    *node_parent(left_page) = old_parent_page_num;
+    *node_parent(right_page) = old_parent_page_num;
 
-  initialize_internal_node(node);
-  *node_is_root_value(node) = 1;
-  *internal_node_num_keys(node) = 1;
-  *internal_node_pointer(node, 0) = left_page_num;
-  *internal_node_rightmost_pointer(node) = right_page_num;
-  *internal_node_key(node, 0) =
-      leaf_node_key_at_slot(left_page, *leaf_node_num_cells(left_page) - 1);
+    void *parent_node = get_page(pager, old_parent_page_num);
+
+    *internal_node_num_keys(parent_node) += 1;
+    uint32_t new_key_index = *internal_node_num_keys(parent_node) - 1;
+    *internal_node_key(parent_node, new_key_index) =
+        leaf_node_key_at_slot(left_page, *leaf_node_num_cells(left_page) - 1);
+    *internal_node_pointer(parent_node, new_key_index) = left_page_num;
+    *internal_node_rightmost_pointer(parent_node) = right_page_num;
+  } else {
+    uint32_t root_page_num = cursor->page_num;
+    *node_parent(left_page) = root_page_num;
+    *node_parent(right_page) = root_page_num;
+
+    initialize_internal_node(node);
+    *node_is_root_value(node) = 1;
+    *internal_node_num_keys(node) = 1;
+    *internal_node_pointer(node, 0) = left_page_num;
+    *internal_node_rightmost_pointer(node) = right_page_num;
+    *internal_node_key(node, 0) =
+        leaf_node_key_at_slot(left_page, *leaf_node_num_cells(left_page) - 1);
+  }
 }
 
 void leaf_node_insert(Cursor *cursor, uint32_t key, Record *record) {
