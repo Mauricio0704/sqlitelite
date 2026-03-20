@@ -106,8 +106,11 @@ const uint32_t INTERNAL_NODE_PAIR_SIZE =
     INTERNAL_NODE_KEY_SIZE + INTERNAL_NODE_POINTER_SIZE;
 
 // Leaf node header
+const uint32_t LEAF_NODE_NEXT_POINTER_SIZE = sizeof(uint32_t);
+const uint32_t LEAF_NODE_NEXT_POINTER_OFFSET = COMMON_NODE_HEADER_SIZE;
 const uint32_t LEAF_NODE_NUM_CELLS_SIZE = sizeof(uint32_t);
-const uint32_t LEAF_NODE_NUM_CELLS_OFFSET = COMMON_NODE_HEADER_SIZE;
+const uint32_t LEAF_NODE_NUM_CELLS_OFFSET =
+    LEAF_NODE_NEXT_POINTER_OFFSET + LEAF_NODE_NEXT_POINTER_SIZE;
 const uint16_t LEAF_NODE_FREE_START_SIZE = sizeof(uint16_t);
 const uint32_t LEAF_NODE_FREE_START_OFFSET =
     LEAF_NODE_NUM_CELLS_OFFSET + LEAF_NODE_NUM_CELLS_SIZE;
@@ -115,8 +118,9 @@ const uint16_t LEAF_NODE_FREE_END_SIZE = sizeof(uint16_t);
 const uint32_t LEAF_NODE_FREE_END_OFFSET =
     LEAF_NODE_FREE_START_OFFSET + LEAF_NODE_FREE_START_SIZE;
 const uint32_t LEAF_NODE_HEADER_SIZE =
-    COMMON_NODE_HEADER_SIZE + LEAF_NODE_NUM_CELLS_SIZE +
-    LEAF_NODE_FREE_START_SIZE + LEAF_NODE_FREE_END_SIZE;
+    COMMON_NODE_HEADER_SIZE + LEAF_NODE_NEXT_POINTER_OFFSET +
+    LEAF_NODE_NUM_CELLS_SIZE + LEAF_NODE_FREE_START_SIZE +
+    LEAF_NODE_FREE_END_SIZE;
 
 const uint32_t LEAF_NODE_SIZE = PAGE_SIZE;
 // Leaf node body
@@ -167,6 +171,10 @@ uint16_t *leaf_node_free_start(void *node) {
 
 uint16_t *leaf_node_free_end(void *node) {
   return node + LEAF_NODE_FREE_END_OFFSET;
+}
+
+uint32_t *leaf_node_next_pointer(void *node) {
+  return node + LEAF_NODE_NEXT_POINTER_OFFSET;
 }
 
 uint16_t *leaf_node_offset_value(void *node, uint16_t slot_num) {
@@ -302,7 +310,12 @@ void advance_cursor(Cursor *cursor) {
   cursor->slot_num += 1;
 
   if (cursor->slot_num >= *leaf_node_num_cells(node)) {
-    cursor->is_end_of_table = 1;
+    if (*leaf_node_next_pointer(node) == 0) {
+      cursor->is_end_of_table = 1;
+      return;
+    }
+    cursor->page_num = *leaf_node_next_pointer(node);
+    cursor->slot_num = 0;
   }
 
   return;
@@ -330,6 +343,7 @@ void initialize_internal_node(void *node) {
 
 void initialize_leaf_node(void *node) {
   initialize_node(node, NODE_TYPE_LEAF);
+  *leaf_node_next_pointer(node) = 0;
   *leaf_node_num_cells(node) = 0;
   *leaf_node_free_start(node) =
       LEAF_NODE_HEADER_SIZE + *leaf_node_num_cells(node) * LEAF_NODE_SLOT_SIZE;
@@ -524,6 +538,8 @@ void leaf_node_split(Cursor *cursor, void *node, uint32_t key, Record *record) {
     }
   }
 
+  *leaf_node_next_pointer(left_page) = right_page_num;
+
   if (!was_root) {
     // For now suppose the parent is always the root node.
     *node_parent(left_page) = old_parent_page_num;
@@ -601,8 +617,23 @@ void execute_insert(Statement *statement, Table *table) {
 }
 
 void execute_select(Statement *statement, Table *table) {
-  Cursor *cursor = new_cursor_start(table);
+  Cursor *cursor =
+      new_cursor_start(table); // -> gives you a cursor at the root page
 
+  // Find the leftmost leaf node.
+  void *node = get_page(table->pager, cursor->page_num);
+
+  while (*node_type_value(node) != NODE_TYPE_LEAF) {
+    uint32_t child_page_num = *internal_node_pointer(node, 0);
+    node = get_page(table->pager, child_page_num);
+    cursor->page_num = child_page_num;
+  }
+
+  // We now need to modify the leaf node structure to support iterating through
+  // the leaf nodes. We can do this by adding a pointer to the next leaf node in
+  // the leaf node header.
+
+  // Iterate through the leaf nodes and print all records.
   while (!(cursor->is_end_of_table)) {
     access_row(cursor);
     advance_cursor(cursor);
