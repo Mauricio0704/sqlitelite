@@ -118,7 +118,7 @@ const uint16_t LEAF_NODE_FREE_END_SIZE = sizeof(uint16_t);
 const uint32_t LEAF_NODE_FREE_END_OFFSET =
     LEAF_NODE_FREE_START_OFFSET + LEAF_NODE_FREE_START_SIZE;
 const uint32_t LEAF_NODE_HEADER_SIZE =
-    COMMON_NODE_HEADER_SIZE + LEAF_NODE_NEXT_POINTER_OFFSET +
+    COMMON_NODE_HEADER_SIZE + LEAF_NODE_NEXT_POINTER_SIZE +
     LEAF_NODE_NUM_CELLS_SIZE + LEAF_NODE_FREE_START_SIZE +
     LEAF_NODE_FREE_END_SIZE;
 
@@ -293,6 +293,7 @@ void *get_record_start(Cursor *cursor) {
          LEAF_NODE_CELL_KEY_SIZE;
 }
 
+// gives you a cursor at the root page
 Cursor *new_cursor_start(Table *table) {
   Cursor *new_cursor = (Cursor *)malloc(sizeof(Cursor));
   new_cursor->page_num = table->root_page_num;
@@ -606,21 +607,72 @@ void access_row(Cursor *cursor) {
   printf("(%d, %s, %s)\n", record.id, record.username, record.email);
 }
 
+/*
+ * execute_insert - Insert a record into the B-tree.
+ *
+ * Traverses the tree from the root downward to locate the correct leaf node:
+ *   - At each internal node, performs a binary search over its separator keys
+ *     to choose the child pointer to follow. If the record's id is less than
+ *     or equal to a separator key, descend through that key's child pointer;
+ *     otherwise descend through the rightmost pointer.
+ *   - Once a leaf node is reached, a second binary search
+ * (leaf_node_offset_find) locates the correct sorted slot within that leaf.
+ *
+ * The record is then inserted at that slot. If the leaf has no free space,
+ * leaf_node_insert triggers a leaf_node_split, which allocates a new page,
+ * redistributes the cells, and updates the parent's separator key and pointers.
+ */
 void execute_insert(Statement *statement, Table *table) {
   Record record = statement->record_to_insert;
-  Cursor *cursor =
-      leaf_node_offset_find(table, table->pager->num_pages - 1, record.id);
 
-  leaf_node_insert(cursor, record.id, &record);
+  Cursor *cursor = new_cursor_start(table);
+  void *node = get_page(table->pager, cursor->page_num);
 
+  while (*node_type_value(node) != NODE_TYPE_LEAF) {
+    // Do a binary search to find the child to descend into.
+    uint32_t left = 0;
+    uint32_t right = *internal_node_num_keys(node);
+
+    while (left < right) {
+      uint32_t middle_index = left + (right - left) / 2;
+      uint32_t middle_key = *internal_node_key(node, middle_index);
+
+      if (record.id <= middle_key) {
+        right = middle_index;
+      } else {
+        left = middle_index + 1;
+      }
+    }
+
+    if (left == *internal_node_num_keys(node)) {
+      cursor->page_num = *internal_node_rightmost_pointer(node);
+    } else {
+      cursor->page_num = *internal_node_pointer(node, left);
+    }
+
+    node = get_page(table->pager, cursor->page_num);
+  }
+
+  Cursor *leaf_cursor =
+      leaf_node_offset_find(table, cursor->page_num, record.id);
+  leaf_node_insert(leaf_cursor, record.id, &record);
+
+  free(leaf_cursor);
   free(cursor);
 }
 
+/*
+ * execute_select - Print all records in the table in ascending key order.
+ *
+ * Finds the leftmost leaf node by following the first child pointer at each
+ * internal node down from the root. Once the leftmost leaf is reached, iterates
+ * through all leaf pages in order using the next-page pointer stored in each
+ * leaf node header, printing every record until the end of the table is
+ * reached.
+ */
 void execute_select(Statement *statement, Table *table) {
-  Cursor *cursor =
-      new_cursor_start(table); // -> gives you a cursor at the root page
+  Cursor *cursor = new_cursor_start(table);
 
-  // Find the leftmost leaf node.
   void *node = get_page(table->pager, cursor->page_num);
 
   while (*node_type_value(node) != NODE_TYPE_LEAF) {
@@ -629,11 +681,6 @@ void execute_select(Statement *statement, Table *table) {
     cursor->page_num = child_page_num;
   }
 
-  // We now need to modify the leaf node structure to support iterating through
-  // the leaf nodes. We can do this by adding a pointer to the next leaf node in
-  // the leaf node header.
-
-  // Iterate through the leaf nodes and print all records.
   while (!(cursor->is_end_of_table)) {
     access_row(cursor);
     advance_cursor(cursor);
