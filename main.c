@@ -39,6 +39,8 @@ typedef enum {
   PREPARE_UNRECOGNIZED_COMMAND
 } PrepareStatus;
 
+typedef enum { EXECUTE_SUCCESS, EXECUTE_DUPLICATE_KEY } ExecuteStatus;
+
 typedef enum {
   META_COMMAND_SUCCESS,
   META_COMMAND_UNRECOGNIZED_COMMAND
@@ -648,7 +650,7 @@ void access_row(Cursor *cursor) {
 
 /* Inserts a record into the B-tree, redistributing nodes and updating parent
  keys as needed.*/
-void execute_insert(Statement *statement, Table *table) {
+ExecuteStatus execute_insert(Statement *statement, Table *table) {
   Record record = statement->record_to_insert;
 
   Cursor *cursor = new_cursor_start(table);
@@ -680,10 +682,21 @@ void execute_insert(Statement *statement, Table *table) {
 
   Cursor *leaf_cursor =
       leaf_node_offset_find(table, cursor->page_num, record.id);
+  uint32_t num_cells = *leaf_node_num_cells(node);
+  if (leaf_cursor->slot_num < num_cells) {
+    uint32_t existing_key = leaf_node_key_at_slot(node, leaf_cursor->slot_num);
+    if (existing_key == record.id) {
+      free(leaf_cursor);
+      free(cursor);
+      return EXECUTE_DUPLICATE_KEY;
+    }
+  }
+
   leaf_node_insert(leaf_cursor, record.id, &record);
 
   free(leaf_cursor);
   free(cursor);
+  return EXECUTE_SUCCESS;
 }
 
 /* Print all records in the table in ascending key order. */
@@ -707,13 +720,16 @@ void execute_select(Statement *statement, Table *table) {
 }
 
 /* Dispatches a prepared statement to its corresponding executor. */
-void execute_statement(Statement *statement, Table *table) {
+ExecuteStatus execute_statement(Statement *statement, Table *table) {
   if (statement->statement_type == STATEMENT_INSERT) {
-    execute_insert(statement, table);
+    return execute_insert(statement, table);
   }
   if (statement->statement_type == STATEMENT_SELECT) {
     execute_select(statement, table);
+    return EXECUTE_SUCCESS;
   }
+
+  return EXECUTE_SUCCESS;
 }
 
 /* Program entry point: opens DB, runs REPL loop, and executes statements. */
@@ -758,7 +774,14 @@ int main(int argc, char *argv[]) {
       break;
     }
 
-    execute_statement(&statement, table);
-    printf("Executed\n");
+    switch (execute_statement(&statement, table)) {
+    case EXECUTE_SUCCESS:
+      printf("Executed\n");
+      break;
+
+    case EXECUTE_DUPLICATE_KEY:
+      printf("Error: Duplicate key.\n");
+      break;
+    }
   }
 }
