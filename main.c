@@ -97,6 +97,7 @@ const uint32_t INTERNAL_NODE_RIGHTMOST_POINTER_OFFSET =
 const uint32_t INTERNAL_NODE_HEADER_SIZE = COMMON_NODE_HEADER_SIZE +
                                            INTERNAL_NODE_NUM_KEYS_SIZE +
                                            INTERNAL_NODE_RIGHTMOST_POINTER_SIZE;
+const uint32_t INTERNAL_NODE_MAX_KEYS = 3;
 
 // Internal node body
 const uint32_t INTERNAL_NODE_POINTER_SIZE = sizeof(uint32_t);
@@ -500,6 +501,104 @@ void read_deserialized_record(void *source, Record *destination) {
   memcpy(&(destination->email), source + EMAIL_OFFSET, EMAIL_SIZE);
 }
 
+/* Splits a full internal (root) node, promotes the middle key, and
+   redistributes keys/children across two new internal nodes. */
+void internal_node_split(Pager *pager, uint32_t node_page_num, uint32_t new_key,
+                         uint32_t new_left_child, uint32_t new_right_child) {
+  void *node = get_page(pager, node_page_num);
+  uint32_t old_num_keys = *internal_node_num_keys(node);
+  uint32_t total_keys = old_num_keys + 1;
+
+  uint32_t old_children[INTERNAL_NODE_MAX_KEYS + 1];
+  for (uint32_t i = 0; i < old_num_keys; i++) {
+    old_children[i] = *internal_node_pointer(node, i);
+  }
+  old_children[old_num_keys] = *internal_node_rightmost_pointer(node);
+
+  uint32_t insert_pos = old_num_keys;
+  for (uint32_t i = 0; i < old_num_keys; i++) {
+    if (new_key < *internal_node_key(node, i)) {
+      insert_pos = i;
+      break;
+    }
+  }
+
+  uint32_t all_keys[INTERNAL_NODE_MAX_KEYS + 1];
+  for (uint32_t i = 0, j = 0; i < total_keys; i++) {
+    if (i == insert_pos) {
+      all_keys[i] = new_key;
+    } else {
+      all_keys[i] = *internal_node_key(node, j);
+      j++;
+    }
+  }
+
+  uint32_t all_children[INTERNAL_NODE_MAX_KEYS + 2];
+  for (uint32_t i = 0, j = 0; i <= total_keys; i++) {
+    if (i == insert_pos + 1) {
+      all_children[i] = new_right_child;
+    } else {
+      all_children[i] = old_children[j];
+      j++;
+    }
+  }
+
+  // Promote the middle key; left/right get the rest
+  uint32_t promote_index = total_keys / 2;
+  uint32_t promoted_key = all_keys[promote_index];
+
+  uint32_t left_page_num = pager->num_pages;
+  pager->num_pages += 1;
+  uint32_t right_page_num = pager->num_pages;
+  pager->num_pages += 1;
+
+  void *left_node = get_page(pager, left_page_num);
+  void *right_node = get_page(pager, right_page_num);
+  initialize_internal_node(left_node);
+  initialize_internal_node(right_node);
+
+  uint32_t left_num_keys = promote_index;
+  *internal_node_num_keys(left_node) = left_num_keys;
+  for (uint32_t i = 0; i < left_num_keys; i++) {
+    *internal_node_key(left_node, i) = all_keys[i];
+    *internal_node_pointer(left_node, i) = all_children[i];
+  }
+  *internal_node_rightmost_pointer(left_node) = all_children[promote_index];
+
+  uint32_t right_num_keys = total_keys - promote_index - 1;
+  *internal_node_num_keys(right_node) = right_num_keys;
+  for (uint32_t i = 0; i < right_num_keys; i++) {
+    *internal_node_key(right_node, i) = all_keys[promote_index + 1 + i];
+    *internal_node_pointer(right_node, i) = all_children[promote_index + 1 + i];
+  }
+  *internal_node_rightmost_pointer(right_node) = all_children[total_keys];
+
+  // Update parent pointers of every child in the new internal nodes
+  *node_parent(left_node) = node_page_num;
+  *node_parent(right_node) = node_page_num;
+
+  for (uint32_t i = 0; i <= left_num_keys; i++) {
+    uint32_t child_page = (i < left_num_keys)
+                              ? *internal_node_pointer(left_node, i)
+                              : *internal_node_rightmost_pointer(left_node);
+    *node_parent(get_page(pager, child_page)) = left_page_num;
+  }
+  for (uint32_t i = 0; i <= right_num_keys; i++) {
+    uint32_t child_page = (i < right_num_keys)
+                              ? *internal_node_pointer(right_node, i)
+                              : *internal_node_rightmost_pointer(right_node);
+    *node_parent(get_page(pager, child_page)) = right_page_num;
+  }
+
+  // Reinitialize the original page as a new root with one key
+  initialize_internal_node(node);
+  *node_is_root_value(node) = 1;
+  *internal_node_num_keys(node) = 1;
+  *internal_node_key(node, 0) = promoted_key;
+  *internal_node_pointer(node, 0) = left_page_num;
+  *internal_node_rightmost_pointer(node) = right_page_num;
+}
+
 /* Inserts a key/value pair into a leaf node at the cursor position. */
 void leaf_node_insert(Cursor *cursor, uint32_t key, Record *record);
 
@@ -549,6 +648,7 @@ void leaf_node_split(Cursor *cursor, void *node, uint32_t key, Record *record) {
 
     left_page = get_page(pager, left_page_num);
   }
+  uint32_t old_next = *leaf_node_next_pointer(node);
   right_page = get_page(pager, right_page_num);
   initialize_leaf_node(left_page);
   initialize_leaf_node(right_page);
@@ -578,20 +678,51 @@ void leaf_node_split(Cursor *cursor, void *node, uint32_t key, Record *record) {
   }
 
   *leaf_node_next_pointer(left_page) = right_page_num;
+  *leaf_node_next_pointer(right_page) = old_next;
 
   if (!was_root) {
-    // For now suppose the parent is always the root node.
     *node_parent(left_page) = old_parent_page_num;
     *node_parent(right_page) = old_parent_page_num;
 
     void *parent_node = get_page(pager, old_parent_page_num);
-
-    *internal_node_num_keys(parent_node) += 1;
-    uint32_t new_key_index = *internal_node_num_keys(parent_node) - 1;
-    *internal_node_key(parent_node, new_key_index) =
+    uint32_t separator_key =
         leaf_node_key_at_slot(left_page, *leaf_node_num_cells(left_page) - 1);
-    *internal_node_pointer(parent_node, new_key_index) = left_page_num;
-    *internal_node_rightmost_pointer(parent_node) = right_page_num;
+
+    if (*internal_node_num_keys(parent_node) >= INTERNAL_NODE_MAX_KEYS) {
+      internal_node_split(pager, old_parent_page_num, separator_key,
+                          left_page_num, right_page_num);
+      return;
+    }
+
+    /* Find which slot in the parent currently holds left_page_num. */
+    uint32_t parent_num_keys = *internal_node_num_keys(parent_node);
+    int32_t parent_slot = -1; /* -1 means left_page_num is the rightmost pointer */
+    for (uint32_t i = 0; i < parent_num_keys; i++) {
+      if (*internal_node_pointer(parent_node, i) == left_page_num) {
+        parent_slot = (int32_t)i;
+        break;
+      }
+    }
+
+    if (parent_slot == -1) {
+      *internal_node_num_keys(parent_node) += 1;
+      uint32_t new_key_index = *internal_node_num_keys(parent_node) - 1;
+      *internal_node_key(parent_node, new_key_index) = separator_key;
+      *internal_node_pointer(parent_node, new_key_index) = left_page_num;
+      *internal_node_rightmost_pointer(parent_node) = right_page_num;
+    } else {
+      uint32_t old_sep_key = *internal_node_key(parent_node, parent_slot);
+      *internal_node_key(parent_node, parent_slot) = separator_key;
+
+      *internal_node_num_keys(parent_node) += 1;
+      for (uint32_t i = parent_num_keys; i > (uint32_t)(parent_slot + 1); i--) {
+        *internal_node_key(parent_node, i) = *internal_node_key(parent_node, i - 1);
+        *internal_node_pointer(parent_node, i) =
+            *internal_node_pointer(parent_node, i - 1);
+      }
+      *internal_node_key(parent_node, parent_slot + 1) = old_sep_key;
+      *internal_node_pointer(parent_node, parent_slot + 1) = right_page_num;
+    }
   } else {
     uint32_t root_page_num = cursor->page_num;
     *node_parent(left_page) = root_page_num;
