@@ -52,11 +52,16 @@ typedef enum {
   NODE_TYPE_INDEFINITE
 } NodeType;
 
-typedef enum { STATEMENT_INSERT, STATEMENT_SELECT } StatementType;
+typedef enum {
+  STATEMENT_INSERT,
+  STATEMENT_SELECT,
+  STATEMENT_DELETE
+} StatementType;
 
 typedef struct {
   StatementType statement_type;
   Record record_to_insert;
+  uint32_t id_to_delete;
 } Statement;
 
 typedef struct {
@@ -469,6 +474,19 @@ PrepareStatus prepare_statement(InputBuffer *input_buffer,
     statement->statement_type = STATEMENT_SELECT;
     return PREPARE_SUCCESS;
   }
+  if (strncmp(input_buffer->buffer, "delete", 6) == 0) {
+    statement->statement_type = STATEMENT_DELETE;
+
+    int args_assigned = sscanf(input_buffer->buffer, "delete %d",
+                               &(statement->id_to_delete));
+    
+    if (args_assigned < 1) {
+      printf("Incorrect arguments for delete\n");
+      return PREPARE_FAILURE;
+    }
+
+    return PREPARE_SUCCESS;
+  }
 
   return PREPARE_UNRECOGNIZED_COMMAND;
 }
@@ -696,7 +714,8 @@ void leaf_node_split(Cursor *cursor, void *node, uint32_t key, Record *record) {
 
     /* Find which slot in the parent currently holds left_page_num. */
     uint32_t parent_num_keys = *internal_node_num_keys(parent_node);
-    int32_t parent_slot = -1; /* -1 means left_page_num is the rightmost pointer */
+    /* -1 means left_page_num is the rightmost pointer */
+    int32_t parent_slot = -1;
     for (uint32_t i = 0; i < parent_num_keys; i++) {
       if (*internal_node_pointer(parent_node, i) == left_page_num) {
         parent_slot = (int32_t)i;
@@ -716,7 +735,8 @@ void leaf_node_split(Cursor *cursor, void *node, uint32_t key, Record *record) {
 
       *internal_node_num_keys(parent_node) += 1;
       for (uint32_t i = parent_num_keys; i > (uint32_t)(parent_slot + 1); i--) {
-        *internal_node_key(parent_node, i) = *internal_node_key(parent_node, i - 1);
+        *internal_node_key(parent_node, i) =
+            *internal_node_key(parent_node, i - 1);
         *internal_node_pointer(parent_node, i) =
             *internal_node_pointer(parent_node, i - 1);
       }
@@ -779,11 +799,10 @@ void access_row(Cursor *cursor) {
   printf("(%d, %s, %s)\n", record.id, record.username, record.email);
 }
 
-/* Inserts a record into the B-tree, redistributing nodes and updating parent
- keys as needed.*/
-ExecuteStatus execute_insert(Statement *statement, Table *table) {
-  Record record = statement->record_to_insert;
-
+/* Traverses the B+ tree to locate a key. Returns a Cursor pointing to the
+   key's position (or insertion point if absent). Sets *key_exists to 1 if the
+   key was found, 0 otherwise. Caller is responsible for freeing the cursor. */
+Cursor *find_key_cursor(Table *table, uint32_t key, int *key_exists) {
   Cursor *cursor = new_cursor_start(table);
   void *node = get_page(table->pager, cursor->page_num);
 
@@ -795,7 +814,7 @@ ExecuteStatus execute_insert(Statement *statement, Table *table) {
       uint32_t middle_index = left + (right - left) / 2;
       uint32_t middle_key = *internal_node_key(node, middle_index);
 
-      if (record.id <= middle_key) {
+      if (key <= middle_key) {
         right = middle_index;
       } else {
         left = middle_index + 1;
@@ -811,21 +830,31 @@ ExecuteStatus execute_insert(Statement *statement, Table *table) {
     node = get_page(table->pager, cursor->page_num);
   }
 
-  Cursor *leaf_cursor =
-      leaf_node_offset_find(table, cursor->page_num, record.id);
+  uint32_t leaf_page_num = cursor->page_num;
+  free(cursor);
+
+  Cursor *leaf_cursor = leaf_node_offset_find(table, leaf_page_num, key);
   uint32_t num_cells = *leaf_node_num_cells(node);
-  if (leaf_cursor->slot_num < num_cells) {
-    uint32_t existing_key = leaf_node_key_at_slot(node, leaf_cursor->slot_num);
-    if (existing_key == record.id) {
-      free(leaf_cursor);
-      free(cursor);
-      return EXECUTE_DUPLICATE_KEY;
-    }
+  *key_exists = (leaf_cursor->slot_num < num_cells &&
+                 leaf_node_key_at_slot(node, leaf_cursor->slot_num) == key);
+
+  return leaf_cursor;
+}
+
+/* Inserts a record into the B-tree, redistributing nodes and updating parent
+ keys as needed.*/
+ExecuteStatus execute_insert(Statement *statement, Table *table) {
+  Record record = statement->record_to_insert;
+
+  int key_exists;
+  Cursor *cursor = find_key_cursor(table, record.id, &key_exists);
+  if (key_exists) {
+    free(cursor);
+    return EXECUTE_DUPLICATE_KEY;
   }
 
-  leaf_node_insert(leaf_cursor, record.id, &record);
+  leaf_node_insert(cursor, record.id, &record);
 
-  free(leaf_cursor);
   free(cursor);
   return EXECUTE_SUCCESS;
 }
@@ -850,6 +879,21 @@ void execute_select(Statement *statement, Table *table) {
   free(cursor);
 }
 
+void execute_delete(Statement *statement, Table *table) {
+  uint32_t key = statement->id_to_delete;
+
+  int key_exists;
+  Cursor *cursor = find_key_cursor(table, key, &key_exists);
+  if (!key_exists) {
+    printf("Key %d does not exist\n", key);
+    return;
+  }
+
+  printf("Delete not implemented.\n");
+
+  free(cursor);
+}
+
 /* Dispatches a prepared statement to its corresponding executor. */
 ExecuteStatus execute_statement(Statement *statement, Table *table) {
   if (statement->statement_type == STATEMENT_INSERT) {
@@ -857,7 +901,9 @@ ExecuteStatus execute_statement(Statement *statement, Table *table) {
   }
   if (statement->statement_type == STATEMENT_SELECT) {
     execute_select(statement, table);
-    return EXECUTE_SUCCESS;
+  }
+  if (statement->statement_type == STATEMENT_DELETE) {
+    execute_delete(statement, table);
   }
 
   return EXECUTE_SUCCESS;
