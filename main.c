@@ -477,9 +477,9 @@ PrepareStatus prepare_statement(InputBuffer *input_buffer,
   if (strncmp(input_buffer->buffer, "delete", 6) == 0) {
     statement->statement_type = STATEMENT_DELETE;
 
-    int args_assigned = sscanf(input_buffer->buffer, "delete %d",
-                               &(statement->id_to_delete));
-    
+    int args_assigned =
+        sscanf(input_buffer->buffer, "delete %d", &(statement->id_to_delete));
+
     if (args_assigned < 1) {
       printf("Incorrect arguments for delete\n");
       return PREPARE_FAILURE;
@@ -889,7 +889,27 @@ void execute_delete(Statement *statement, Table *table) {
     return;
   }
 
-  printf("Delete not implemented.\n");
+  /*
+  From SQLite design system:
+  Suppose the key value is there , and i be the corresponding index at the
+  entries. All entries with index greater than i are moved down one element. If
+  the number of remaining entries does not fall below the lower bound of page
+  occupancy, the delete terminates then and there . Suppose the leaf occupancy
+  falls below the lower bound. We need to restructure the tree (by merging
+  sibling nodes) bottom up starting from this node.
+
+  We do the following until the restructuring process terminates
+
+  For now, we are going to suppose the leaf occupancy never leaves the lower
+  bound.
+  */
+  void *node = get_page(table->pager, cursor->page_num);
+  uint32_t num_cells = *leaf_node_num_cells(node);
+  for (uint32_t i = cursor->slot_num + 1; i < num_cells; ++i) {
+    *leaf_node_offset_value(node, i - 1) = *leaf_node_offset_value(node, i);
+  }
+  *leaf_node_num_cells(node) -= 1;
+  *leaf_node_free_start(node) -= LEAF_NODE_SLOT_SIZE;
 
   free(cursor);
 }
