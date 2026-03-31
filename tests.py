@@ -121,7 +121,7 @@ class TestInsertBasic(DBTestCase):
         self.assertIn("Error: Duplicate key.", lines)
 
     def test_unrecognized_sql_command(self):
-        lines = self.run_cmds(["delete 1", ".exit"])
+        lines = self.run_cmds(["notacommand 1", ".exit"])
         # No 'Executed' and no crash
         self.assertNotIn("Executed", lines)
 
