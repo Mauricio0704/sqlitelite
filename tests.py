@@ -389,5 +389,209 @@ class TestEndToEnd(DBTestCase):
         self.assertEqual(len(rows), 15)
 
 
+# ---------------------------------------------------------------------------
+# 9. Delete – basic behaviour (no underflow)
+# ---------------------------------------------------------------------------
+
+
+class TestDeleteBasic(DBTestCase):
+    """Delete operations that do NOT trigger underflow (root leaf only)."""
+
+    def test_delete_single_key(self):
+        lines = self.run_cmds([
+            "insert 1 alice a@x.com",
+            "insert 2 bob b@x.com",
+            "insert 3 charlie c@x.com",
+            "delete 2",
+            "select",
+            ".exit",
+        ])
+        rows = [l for l in lines if l.startswith("(")]
+        ids = [int(r.split(",")[0].strip("( ")) for r in rows]
+        self.assertEqual(ids, [1, 3])
+
+    def test_delete_nonexistent_key(self):
+        lines = self.run_cmds([
+            "insert 1 alice a@x.com",
+            "delete 99",
+            ".exit",
+        ])
+        self.assertIn("Key 99 does not exist", lines)
+
+    def test_delete_first_key(self):
+        lines = self.run_cmds([
+            "insert 1 alice a@x.com",
+            "insert 2 bob b@x.com",
+            "insert 3 charlie c@x.com",
+            "delete 1",
+            "select",
+            ".exit",
+        ])
+        rows = [l for l in lines if l.startswith("(")]
+        ids = [int(r.split(",")[0].strip("( ")) for r in rows]
+        self.assertEqual(ids, [2, 3])
+
+    def test_delete_last_key(self):
+        lines = self.run_cmds([
+            "insert 1 alice a@x.com",
+            "insert 2 bob b@x.com",
+            "insert 3 charlie c@x.com",
+            "delete 3",
+            "select",
+            ".exit",
+        ])
+        rows = [l for l in lines if l.startswith("(")]
+        ids = [int(r.split(",")[0].strip("( ")) for r in rows]
+        self.assertEqual(ids, [1, 2])
+
+    def test_delete_only_key_in_root_leaf(self):
+        lines = self.run_cmds([
+            "insert 1 alice a@x.com",
+            "delete 1",
+            "select",
+            ".exit",
+        ])
+        rows = [l for l in lines if l.startswith("(")]
+        self.assertEqual(len(rows), 0)
+
+    def test_delete_then_reinsert(self):
+        lines = self.run_cmds([
+            "insert 1 alice a@x.com",
+            "insert 2 bob b@x.com",
+            "delete 1",
+            "insert 1 alice2 a2@x.com",
+            "select",
+            ".exit",
+        ])
+        rows = [l for l in lines if l.startswith("(")]
+        self.assertEqual(len(rows), 2)
+        self.assertIn("(1, alice2, a2@x.com)", lines)
+
+    def test_delete_persists_after_restart(self):
+        run_db([
+            "insert 1 alice a@x.com",
+            "insert 2 bob b@x.com",
+            "insert 3 charlie c@x.com",
+            "delete 2",
+            ".exit",
+        ], self.db)
+        lines = strip_prompts(run_db(["select", ".exit"], self.db))
+        rows = [l for l in lines if l.startswith("(")]
+        ids = [int(r.split(",")[0].strip("( ")) for r in rows]
+        self.assertEqual(ids, [1, 3])
+
+
+# ---------------------------------------------------------------------------
+# 10. Delete – underflow / rebalancing
+#     These tests WILL FAIL until handle_underflow() and its helpers
+#     (leaf_node_redistribute, leaf_node_merge, internal_node_redistribute,
+#     internal_node_merge) are implemented.
+# ---------------------------------------------------------------------------
+
+
+class TestDeleteUnderflow(DBTestCase):
+    """Delete operations that trigger underflow and require rebalancing."""
+
+    def _insert_range(self, start, end):
+        return [f"insert {i} user{i} u{i}@x.com" for i in range(start, end)]
+
+    def test_leaf_redistribute(self):
+        """Insert 14 keys (split into two 7-cell leaves), then delete 2
+        from one leaf to trigger redistribute from its sibling."""
+        cmds = self._insert_range(1, 15)
+        cmds += ["delete 1", "delete 2", "select", ".exit"]
+        lines = self.run_cmds(cmds)
+        rows = [l for l in lines if l.startswith("(")]
+        ids = [int(r.split(",")[0].strip("( ")) for r in rows]
+        self.assertEqual(ids, list(range(3, 15)))
+
+    def test_leaf_merge(self):
+        """Delete enough keys to force a leaf merge."""
+        cmds = self._insert_range(1, 15)
+        for i in range(1, 9):
+            cmds.append(f"delete {i}")
+        cmds += ["select", ".exit"]
+        lines = self.run_cmds(cmds)
+        rows = [l for l in lines if l.startswith("(")]
+        ids = [int(r.split(",")[0].strip("( ")) for r in rows]
+        self.assertEqual(ids, list(range(9, 15)))
+
+    def test_delete_all_one_by_one(self):
+        """Insert 30 keys, delete them all, verify empty table."""
+        n = 30
+        cmds = self._insert_range(1, n + 1)
+        for i in range(1, n + 1):
+            cmds.append(f"delete {i}")
+        cmds += ["select", ".exit"]
+        lines = self.run_cmds(cmds)
+        rows = [l for l in lines if l.startswith("(")]
+        self.assertEqual(len(rows), 0)
+
+    def test_root_collapse(self):
+        """Delete until the tree shrinks back to a single leaf root."""
+        n = 20
+        cmds = self._insert_range(1, n + 1)
+        for i in range(1, n - 2):
+            cmds.append(f"delete {i}")
+        cmds += ["select", ".exit"]
+        lines = self.run_cmds(cmds)
+        rows = [l for l in lines if l.startswith("(")]
+        ids = [int(r.split(",")[0].strip("( ")) for r in rows]
+        self.assertEqual(ids, list(range(n - 2, n + 1)))
+
+    def test_insert_after_rebalance(self):
+        """After rebalancing, inserts should still work correctly."""
+        cmds = self._insert_range(1, 15)
+        for i in range(1, 8):
+            cmds.append(f"delete {i}")
+        cmds += [
+            "insert 100 new1 new1@x.com",
+            "insert 200 new2 new2@x.com",
+            "select",
+            ".exit",
+        ]
+        lines = self.run_cmds(cmds)
+        rows = [l for l in lines if l.startswith("(")]
+        ids = [int(r.split(",")[0].strip("( ")) for r in rows]
+        self.assertEqual(ids, sorted(ids))
+        self.assertIn(100, ids)
+        self.assertIn(200, ids)
+
+    def test_persistence_after_rebalance(self):
+        """Data must survive restart after rebalancing."""
+        cmds = self._insert_range(1, 15)
+        for i in range(1, 8):
+            cmds.append(f"delete {i}")
+        run_db(cmds + [".exit"], self.db)
+        lines = strip_prompts(run_db(["select", ".exit"], self.db))
+        rows = [l for l in lines if l.startswith("(")]
+        ids = [int(r.split(",")[0].strip("( ")) for r in rows]
+        self.assertEqual(ids, list(range(8, 15)))
+
+    def test_deep_tree_internal_merge(self):
+        """60 keys → internal splits. Delete 45 to trigger internal merges."""
+        n = 60
+        cmds = self._insert_range(1, n + 1)
+        for i in range(1, 46):
+            cmds.append(f"delete {i}")
+        cmds += ["select", ".exit"]
+        lines = self.run_cmds(cmds)
+        rows = [l for l in lines if l.startswith("(")]
+        ids = [int(r.split(",")[0].strip("( ")) for r in rows]
+        self.assertEqual(ids, list(range(46, n + 1)))
+
+    def test_alternating_delete(self):
+        """Delete every other key, verify sorted order is maintained."""
+        n = 30
+        cmds = self._insert_range(1, n + 1)
+        for i in range(1, n + 1, 2):
+            cmds.append(f"delete {i}")
+        cmds += ["select", ".exit"]
+        lines = self.run_cmds(cmds)
+        rows = [l for l in lines if l.startswith("(")]
+        ids = [int(r.split(",")[0].strip("( ")) for r in rows]
+        self.assertEqual(ids, list(range(2, n + 1, 2)))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
