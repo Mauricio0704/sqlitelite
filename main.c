@@ -102,7 +102,7 @@ const uint32_t INTERNAL_NODE_RIGHTMOST_POINTER_OFFSET =
 const uint32_t INTERNAL_NODE_HEADER_SIZE = COMMON_NODE_HEADER_SIZE +
                                            INTERNAL_NODE_NUM_KEYS_SIZE +
                                            INTERNAL_NODE_RIGHTMOST_POINTER_SIZE;
-const uint32_t INTERNAL_NODE_MAX_KEYS = 3;
+enum { INTERNAL_NODE_MAX_KEYS = 3 };
 
 // Internal node body
 const uint32_t INTERNAL_NODE_POINTER_SIZE = sizeof(uint32_t);
@@ -209,11 +209,6 @@ uint32_t leaf_node_key_at_slot(void *node, uint32_t slot_num) {
   uint32_t key;
   memcpy(&key, (uint8_t *)node + cell_offset, sizeof(key));
   return key;
-}
-
-/* Returns the byte offset to the value area for a slot's cell payload. */
-uint32_t leaf_node_cell_value_at_slot(void *node, uint32_t slot_num) {
-  return leaf_node_key_at_slot(node, slot_num) + LEAF_NODE_CELL_KEY_SIZE;
 }
 
 typedef struct {
@@ -520,13 +515,50 @@ void read_deserialized_record(void *source, Record *destination) {
   memcpy(&(destination->email), source + EMAIL_OFFSET, EMAIL_SIZE);
 }
 
-/* Splits a full internal (root) node, promotes the middle key, and
-   redistributes keys/children across two new internal nodes. */
+/* Inserts a new key+child into a parent internal node that has room. */
+void internal_node_insert_key(Pager *pager, uint32_t parent_page_num,
+                              uint32_t promoted_key, uint32_t left_child_page,
+                              uint32_t right_child_page) {
+  void *parent = get_page(pager, parent_page_num);
+  uint32_t parent_num_keys = *internal_node_num_keys(parent);
+
+  int32_t parent_slot = -1;
+  for (uint32_t i = 0; i < parent_num_keys; i++) {
+    if (*internal_node_pointer(parent, i) == left_child_page) {
+      parent_slot = (int32_t)i;
+      break;
+    }
+  }
+
+  if (parent_slot == -1) {
+    /* left_child_page is the rightmost pointer. */
+    *internal_node_num_keys(parent) += 1;
+    *internal_node_key(parent, parent_num_keys) = promoted_key;
+    *internal_node_pointer(parent, parent_num_keys) = left_child_page;
+    *internal_node_rightmost_pointer(parent) = right_child_page;
+  } else {
+    uint32_t old_sep = *internal_node_key(parent, parent_slot);
+    *internal_node_key(parent, parent_slot) = promoted_key;
+
+    *internal_node_num_keys(parent) += 1;
+    for (uint32_t i = parent_num_keys; i > (uint32_t)(parent_slot + 1); i--) {
+      *internal_node_key(parent, i) = *internal_node_key(parent, i - 1);
+      *internal_node_pointer(parent, i) = *internal_node_pointer(parent, i - 1);
+    }
+    *internal_node_key(parent, parent_slot + 1) = old_sep;
+    *internal_node_pointer(parent, parent_slot + 1) = right_child_page;
+  }
+}
+
+/* Splits a full internal node, promotes the middle key, and redistributes
+   keys/children. Handles both root and non-root nodes correctly. */
 void internal_node_split(Pager *pager, uint32_t node_page_num, uint32_t new_key,
                          uint32_t new_left_child, uint32_t new_right_child) {
   void *node = get_page(pager, node_page_num);
   uint32_t old_num_keys = *internal_node_num_keys(node);
   uint32_t total_keys = old_num_keys + 1;
+  uint8_t was_root = *node_is_root_value(node);
+  uint32_t old_parent_page = *node_parent(node);
 
   uint32_t old_children[INTERNAL_NODE_MAX_KEYS + 1];
   for (uint32_t i = 0; i < old_num_keys; i++) {
@@ -562,60 +594,112 @@ void internal_node_split(Pager *pager, uint32_t node_page_num, uint32_t new_key,
     }
   }
 
-  // Promote the middle key; left/right get the rest
   uint32_t promote_index = total_keys / 2;
   uint32_t promoted_key = all_keys[promote_index];
-
-  uint32_t left_page_num = pager->num_pages;
-  pager->num_pages += 1;
-  uint32_t right_page_num = pager->num_pages;
-  pager->num_pages += 1;
-
-  void *left_node = get_page(pager, left_page_num);
-  void *right_node = get_page(pager, right_page_num);
-  initialize_internal_node(left_node);
-  initialize_internal_node(right_node);
-
   uint32_t left_num_keys = promote_index;
-  *internal_node_num_keys(left_node) = left_num_keys;
-  for (uint32_t i = 0; i < left_num_keys; i++) {
-    *internal_node_key(left_node, i) = all_keys[i];
-    *internal_node_pointer(left_node, i) = all_children[i];
-  }
-  *internal_node_rightmost_pointer(left_node) = all_children[promote_index];
-
   uint32_t right_num_keys = total_keys - promote_index - 1;
-  *internal_node_num_keys(right_node) = right_num_keys;
-  for (uint32_t i = 0; i < right_num_keys; i++) {
-    *internal_node_key(right_node, i) = all_keys[promote_index + 1 + i];
-    *internal_node_pointer(right_node, i) = all_children[promote_index + 1 + i];
-  }
-  *internal_node_rightmost_pointer(right_node) = all_children[total_keys];
 
-  // Update parent pointers of every child in the new internal nodes
-  *node_parent(left_node) = node_page_num;
-  *node_parent(right_node) = node_page_num;
+  if (was_root) {
+    /* Root split: create two new child pages, reinitialize original as root. */
+    uint32_t left_page_num = pager->num_pages;
+    pager->num_pages += 1;
+    uint32_t right_page_num = pager->num_pages;
+    pager->num_pages += 1;
 
-  for (uint32_t i = 0; i <= left_num_keys; i++) {
-    uint32_t child_page = (i < left_num_keys)
-                              ? *internal_node_pointer(left_node, i)
+    void *left_node = get_page(pager, left_page_num);
+    void *right_node = get_page(pager, right_page_num);
+    initialize_internal_node(left_node);
+    initialize_internal_node(right_node);
+
+    *internal_node_num_keys(left_node) = left_num_keys;
+    for (uint32_t i = 0; i < left_num_keys; i++) {
+      *internal_node_key(left_node, i) = all_keys[i];
+      *internal_node_pointer(left_node, i) = all_children[i];
+    }
+    *internal_node_rightmost_pointer(left_node) = all_children[promote_index];
+
+    *internal_node_num_keys(right_node) = right_num_keys;
+    for (uint32_t i = 0; i < right_num_keys; i++) {
+      *internal_node_key(right_node, i) = all_keys[promote_index + 1 + i];
+      *internal_node_pointer(right_node, i) =
+          all_children[promote_index + 1 + i];
+    }
+    *internal_node_rightmost_pointer(right_node) = all_children[total_keys];
+
+    *node_parent(left_node) = node_page_num;
+    *node_parent(right_node) = node_page_num;
+
+    for (uint32_t i = 0; i <= left_num_keys; i++) {
+      uint32_t child_page =
+          (i < left_num_keys) ? *internal_node_pointer(left_node, i)
                               : *internal_node_rightmost_pointer(left_node);
-    *node_parent(get_page(pager, child_page)) = left_page_num;
-  }
-  for (uint32_t i = 0; i <= right_num_keys; i++) {
-    uint32_t child_page = (i < right_num_keys)
-                              ? *internal_node_pointer(right_node, i)
-                              : *internal_node_rightmost_pointer(right_node);
-    *node_parent(get_page(pager, child_page)) = right_page_num;
-  }
+      *node_parent(get_page(pager, child_page)) = left_page_num;
+    }
+    for (uint32_t i = 0; i <= right_num_keys; i++) {
+      uint32_t child_page =
+          (i < right_num_keys) ? *internal_node_pointer(right_node, i)
+                               : *internal_node_rightmost_pointer(right_node);
+      *node_parent(get_page(pager, child_page)) = right_page_num;
+    }
 
-  // Reinitialize the original page as a new root with one key
-  initialize_internal_node(node);
-  *node_is_root_value(node) = 1;
-  *internal_node_num_keys(node) = 1;
-  *internal_node_key(node, 0) = promoted_key;
-  *internal_node_pointer(node, 0) = left_page_num;
-  *internal_node_rightmost_pointer(node) = right_page_num;
+    initialize_internal_node(node);
+    *node_is_root_value(node) = 1;
+    *internal_node_num_keys(node) = 1;
+    *internal_node_key(node, 0) = promoted_key;
+    *internal_node_pointer(node, 0) = left_page_num;
+    *internal_node_rightmost_pointer(node) = right_page_num;
+  } else {
+    /* Non-root split: keep original page as left, create new right page,
+       and propagate the promoted key up to the parent. */
+    uint32_t right_page_num = pager->num_pages;
+    pager->num_pages += 1;
+    void *right_node = get_page(pager, right_page_num);
+    initialize_internal_node(right_node);
+
+    /* Rebuild the original node as the left half. */
+    initialize_internal_node(node);
+    *node_parent(node) = old_parent_page;
+    *internal_node_num_keys(node) = left_num_keys;
+    for (uint32_t i = 0; i < left_num_keys; i++) {
+      *internal_node_key(node, i) = all_keys[i];
+      *internal_node_pointer(node, i) = all_children[i];
+    }
+    *internal_node_rightmost_pointer(node) = all_children[promote_index];
+
+    /* Fill the right half. */
+    *internal_node_num_keys(right_node) = right_num_keys;
+    for (uint32_t i = 0; i < right_num_keys; i++) {
+      *internal_node_key(right_node, i) = all_keys[promote_index + 1 + i];
+      *internal_node_pointer(right_node, i) =
+          all_children[promote_index + 1 + i];
+    }
+    *internal_node_rightmost_pointer(right_node) = all_children[total_keys];
+
+    /* Update children's parent pointers. */
+    for (uint32_t i = 0; i <= left_num_keys; i++) {
+      uint32_t child_page =
+          (i < left_num_keys) ? *internal_node_pointer(node, i)
+                              : *internal_node_rightmost_pointer(node);
+      *node_parent(get_page(pager, child_page)) = node_page_num;
+    }
+    *node_parent(right_node) = old_parent_page;
+    for (uint32_t i = 0; i <= right_num_keys; i++) {
+      uint32_t child_page =
+          (i < right_num_keys) ? *internal_node_pointer(right_node, i)
+                               : *internal_node_rightmost_pointer(right_node);
+      *node_parent(get_page(pager, child_page)) = right_page_num;
+    }
+
+    /* Insert promoted key into parent. */
+    void *parent = get_page(pager, old_parent_page);
+    if (*internal_node_num_keys(parent) >= INTERNAL_NODE_MAX_KEYS) {
+      internal_node_split(pager, old_parent_page, promoted_key,
+                          node_page_num, right_page_num);
+    } else {
+      internal_node_insert_key(pager, old_parent_page, promoted_key,
+                               node_page_num, right_page_num);
+    }
+  }
 }
 
 /* Inserts a key/value pair into a leaf node at the cursor position. */
@@ -713,37 +797,8 @@ void leaf_node_split(Cursor *cursor, void *node, uint32_t key, Record *record) {
       return;
     }
 
-    /* Find which slot in the parent currently holds left_page_num. */
-    uint32_t parent_num_keys = *internal_node_num_keys(parent_node);
-    /* -1 means left_page_num is the rightmost pointer */
-    int32_t parent_slot = -1;
-    for (uint32_t i = 0; i < parent_num_keys; i++) {
-      if (*internal_node_pointer(parent_node, i) == left_page_num) {
-        parent_slot = (int32_t)i;
-        break;
-      }
-    }
-
-    if (parent_slot == -1) {
-      *internal_node_num_keys(parent_node) += 1;
-      uint32_t new_key_index = *internal_node_num_keys(parent_node) - 1;
-      *internal_node_key(parent_node, new_key_index) = separator_key;
-      *internal_node_pointer(parent_node, new_key_index) = left_page_num;
-      *internal_node_rightmost_pointer(parent_node) = right_page_num;
-    } else {
-      uint32_t old_sep_key = *internal_node_key(parent_node, parent_slot);
-      *internal_node_key(parent_node, parent_slot) = separator_key;
-
-      *internal_node_num_keys(parent_node) += 1;
-      for (uint32_t i = parent_num_keys; i > (uint32_t)(parent_slot + 1); i--) {
-        *internal_node_key(parent_node, i) =
-            *internal_node_key(parent_node, i - 1);
-        *internal_node_pointer(parent_node, i) =
-            *internal_node_pointer(parent_node, i - 1);
-      }
-      *internal_node_key(parent_node, parent_slot + 1) = old_sep_key;
-      *internal_node_pointer(parent_node, parent_slot + 1) = right_page_num;
-    }
+    internal_node_insert_key(pager, old_parent_page_num, separator_key,
+                             left_page_num, right_page_num);
   } else {
     uint32_t root_page_num = cursor->page_num;
     *node_parent(left_page) = root_page_num;
@@ -1007,10 +1062,10 @@ void collapse_root(Table *table) {
 }
 
 /*
- Redistribute cells between a leaf node and one of its siblings.
+  Redistribute cells between a leaf node and one of its siblings.
   Called when a leaf drops below LEAF_NODE_MIN_CELLS but a sibling has
   more cells than LEAF_NODE_MIN_CELLS (so it can spare one).
- */
+*/
 void leaf_node_redistribute(Pager *pager, uint32_t node_page_num,
                             uint32_t sibling_page_num, uint32_t separator_index,
                             int sibling_is_left) {
@@ -1092,10 +1147,165 @@ void leaf_node_merge(Pager *pager, uint32_t left_page_num,
 
   void *parent = get_page(pager, *node_parent(left_node));
   internal_node_remove_key(parent, separator_index);
+
+  /* Evict the now-orphaned right page from the pager cache. */
+  pager->pages[right_page_num] = NULL;
+  free(right_node);
+}
+
+/* Number of children in an internal node is always num_keys + 1. */
+uint32_t internal_node_num_children(void *node) {
+  return *internal_node_num_keys(node) + 1;
+}
+
+/* Redistribution for internal-node underflow. */
+void internal_node_redistribute(Pager *pager, uint32_t node_page_num,
+                                uint32_t sibling_page_num,
+                                uint32_t separator_index, int sibling_is_left) {
+  void *node = get_page(pager, node_page_num);
+  void *sibling = get_page(pager, sibling_page_num);
+
+  uint32_t parent_page_num = *node_parent(node);
+  void *parent = get_page(pager, parent_page_num);
+
+  uint32_t node_num_keys = *internal_node_num_keys(node);
+  uint32_t sibling_num_keys = *internal_node_num_keys(sibling);
+
+  if (sibling_is_left) {
+    memmove((uint8_t *)node + INTERNAL_NODE_HEADER_SIZE +
+                INTERNAL_NODE_PAIR_SIZE,
+            (uint8_t *)node + INTERNAL_NODE_HEADER_SIZE,
+            node_num_keys * INTERNAL_NODE_PAIR_SIZE);
+
+    uint32_t moved_child = *internal_node_rightmost_pointer(sibling);
+    *internal_node_pointer(node, 0) = moved_child;
+
+    // Bring parent's separator key down into node as node's new first key.
+    *internal_node_key(node, 0) = *internal_node_key(parent, separator_index);
+
+    // Move sibling's last key up to parent[separator_index].
+    *internal_node_key(parent, separator_index) =
+        *internal_node_key(sibling, sibling_num_keys - 1);
+
+    // Move sibling's rightmost child to become node's new first child.
+    *internal_node_rightmost_pointer(sibling) =
+        *internal_node_pointer(sibling, sibling_num_keys - 1);
+
+    *node_parent(get_page(pager, moved_child)) = node_page_num;
+  } else {
+    uint32_t moved_child = internal_node_child(sibling, 0);
+    uint32_t old_rightmost_child = *internal_node_rightmost_pointer(node);
+
+    // Bring parent's separator key down into node as node's new last key.
+    *internal_node_key(node, node_num_keys) =
+        *internal_node_key(parent, separator_index);
+
+    *internal_node_pointer(node, node_num_keys) = old_rightmost_child;
+
+    // Move sibling's leftmost child to become node's new rightmost child.
+    *internal_node_rightmost_pointer(node) = moved_child;
+
+    // Move sibling's first key up to parent[separator_index].
+    *internal_node_key(parent, separator_index) =
+        *internal_node_key(sibling, 0);
+
+    memmove((uint8_t *)sibling + INTERNAL_NODE_HEADER_SIZE,
+            (uint8_t *)sibling + INTERNAL_NODE_HEADER_SIZE +
+                INTERNAL_NODE_PAIR_SIZE,
+            (sibling_num_keys - 1) * INTERNAL_NODE_PAIR_SIZE);
+
+    *node_parent(get_page(pager, moved_child)) = node_page_num;
+  }
+
+  *internal_node_num_keys(node) = node_num_keys + 1;
+  *internal_node_num_keys(sibling) = sibling_num_keys - 1;
+}
+
+/* Implement merge for internal-node underflow. */
+void internal_node_merge(Pager *pager, uint32_t left_page_num,
+                         uint32_t right_page_num, uint32_t separator_index) {
+  void *left_node = get_page(pager, left_page_num);
+  void *right_node = get_page(pager, right_page_num);
+
+  uint32_t parent_node_num = *node_parent(left_node);
+  void *parent = get_page(pager, parent_node_num);
+
+  uint32_t left_node_num_keys = *internal_node_num_keys(left_node);
+  uint32_t right_node_num_keys = *internal_node_num_keys(right_node);
+
+  /* Place bridge key at pair[L] and left's old rightmost as its left child. */
+  *internal_node_key(left_node, left_node_num_keys) =
+      *internal_node_key(parent, separator_index);
+  *internal_node_pointer(left_node, left_node_num_keys) =
+      *internal_node_rightmost_pointer(left_node);
+
+  /* Append right's keys and children starting at pair[L+1]. */
+  for (uint32_t i = 0; i < right_node_num_keys; ++i) {
+    *internal_node_key(left_node, left_node_num_keys + 1 + i) =
+        *internal_node_key(right_node, i);
+
+    uint32_t node_num_to_append = *internal_node_pointer(right_node, i);
+    *internal_node_pointer(left_node, left_node_num_keys + 1 + i) =
+        node_num_to_append;
+
+    void *node_to_append = get_page(pager, node_num_to_append);
+    *node_parent(node_to_append) = left_page_num;
+  }
+
+  /* Transfer right's rightmost child to left, update its parent pointer. */
+  uint32_t right_rightmost = *internal_node_rightmost_pointer(right_node);
+  *internal_node_rightmost_pointer(left_node) = right_rightmost;
+  *node_parent(get_page(pager, right_rightmost)) = left_page_num;
+
+  /* Update left's key count: bridge key + all of right's keys. */
+  *internal_node_num_keys(left_node) =
+      left_node_num_keys + 1 + right_node_num_keys;
+
+  internal_node_remove_key(parent, separator_index);
+
+  /* Evict the right page from the pager cache without a double-free. */
+  pager->pages[right_page_num] = NULL;
+  free(right_node);
+}
+
+void handle_internal_node_underflow(Pager *pager, uint32_t page_num,
+                                    void *parent, int32_t child_idx,
+                                    uint32_t num_parent_keys) {
+  int has_left = (child_idx > 0);
+  int has_right = ((uint32_t)child_idx < num_parent_keys);
+
+  uint32_t left_sib_page = 0, right_sib_page = 0;
+  uint32_t left_sep = 0, right_sep = 0;
+
+  if (has_left) {
+    left_sib_page = internal_node_child(parent, child_idx - 1);
+    left_sep = (uint32_t)child_idx - 1;
+  }
+  if (has_right) {
+    right_sib_page = internal_node_child(parent, child_idx + 1);
+    right_sep = (uint32_t)child_idx;
+  }
+
+  if (has_left && *internal_node_num_keys(get_page(pager, left_sib_page)) >
+                      INTERNAL_NODE_MIN_KEYS) {
+    internal_node_redistribute(pager, page_num, left_sib_page, left_sep, 1);
+    return;
+  }
+  if (has_right && *internal_node_num_keys(get_page(pager, right_sib_page)) >
+                       INTERNAL_NODE_MIN_KEYS) {
+    internal_node_redistribute(pager, page_num, right_sib_page, right_sep, 0);
+    return;
+  }
+
+  if (has_left) {
+    internal_node_merge(pager, left_sib_page, page_num, left_sep);
+  } else {
+    internal_node_merge(pager, page_num, right_sib_page, right_sep);
+  }
 }
 
 /* Handle underflow after a deletion causes a node to drop below
-   minimum occupancy. Currently supports leaf-level rebalancing only. */
+   minimum occupancy. */
 void handle_underflow(Pager *pager, Table *table, uint32_t page_num) {
   void *node = get_page(pager, page_num);
 
@@ -1130,15 +1340,13 @@ void handle_underflow(Pager *pager, Table *table, uint32_t page_num) {
 
   if (*node_type_value(node) == NODE_TYPE_LEAF) {
     /* Try redistribute first: pick a sibling above minimum. */
-    if (has_left &&
-        *leaf_node_num_cells(get_page(pager, left_sib_page)) >
-            LEAF_NODE_MIN_CELLS) {
+    if (has_left && *leaf_node_num_cells(get_page(pager, left_sib_page)) >
+                        LEAF_NODE_MIN_CELLS) {
       leaf_node_redistribute(pager, page_num, left_sib_page, left_sep, 1);
       return;
     }
-    if (has_right &&
-        *leaf_node_num_cells(get_page(pager, right_sib_page)) >
-            LEAF_NODE_MIN_CELLS) {
+    if (has_right && *leaf_node_num_cells(get_page(pager, right_sib_page)) >
+                         LEAF_NODE_MIN_CELLS) {
       leaf_node_redistribute(pager, page_num, right_sib_page, right_sep, 0);
       return;
     }
@@ -1150,16 +1358,16 @@ void handle_underflow(Pager *pager, Table *table, uint32_t page_num) {
     } else {
       leaf_node_merge(pager, page_num, right_sib_page, right_sep);
     }
+  } else if (*node_type_value(node) == NODE_TYPE_INTERNAL) {
+    handle_internal_node_underflow(pager, page_num, parent, child_idx,
+                                   num_parent_keys);
   }
-
-  /* TODO: add internal-node redistribute / merge here later. */
 
   /* After a merge the parent lost a key — check for parent underflow. */
   uint32_t parent_keys = *internal_node_num_keys(parent);
   if (*node_is_root_value(parent) && parent_keys == 0)
     collapse_root(table);
-  else if (!*node_is_root_value(parent) &&
-           parent_keys < INTERNAL_NODE_MIN_KEYS)
+  else if (!*node_is_root_value(parent) && parent_keys < INTERNAL_NODE_MIN_KEYS)
     handle_underflow(pager, table, parent_page);
 }
 
