@@ -142,8 +142,9 @@ const uint32_t LEAF_NODE_SPACE_FOR_CELLS =
     LEAF_NODE_SIZE - LEAF_NODE_HEADER_SIZE;
 const uint32_t LEAF_NODE_CELL_SIZE =
     LEAF_NODE_CELL_KEY_SIZE + LEAF_NODE_CELL_VALUE_SIZE;
-const uint32_t LEAF_NODE_MAX_CELLS =
-    LEAF_NODE_SPACE_FOR_CELLS / LEAF_NODE_CELL_SIZE;
+enum { LEAF_NODE_MAX_CELLS = LEAF_NODE_SPACE_FOR_CELLS / LEAF_NODE_CELL_SIZE };
+const uint32_t LEAF_NODE_MIN_CELLS = LEAF_NODE_MAX_CELLS / 2;
+const uint32_t INTERNAL_NODE_MIN_KEYS = INTERNAL_NODE_MAX_KEYS / 2;
 
 /* Returns a pointer to the node root flag field. */
 uint8_t *node_is_root_value(void *node) { return node + NODE_IS_ROOT_OFFSET; }
@@ -879,6 +880,289 @@ void execute_select(Statement *statement, Table *table) {
   free(cursor);
 }
 
+/* Reads all cells from a leaf node into parallel key/record arrays.
+   Returns the number of cells read. */
+uint32_t leaf_node_read_all_cells(void *node, uint32_t *keys_out,
+                                  Record *records_out) {
+  uint32_t num_cells = *leaf_node_num_cells(node);
+  for (uint32_t i = 0; i < num_cells; i++) {
+    keys_out[i] = leaf_node_key_at_slot(node, i);
+    uint16_t cell_offset = *leaf_node_offset_value(node, (uint16_t)i);
+    read_deserialized_record((uint8_t *)node + cell_offset +
+                                 LEAF_NODE_CELL_KEY_SIZE,
+                             &records_out[i]);
+  }
+  return num_cells;
+}
+
+/* Rebuilds a leaf node from scratch using the given key/record arrays.
+   Preserves is_root and parent_ptr. Sets next_pointer to next_ptr.
+   This reclaims fragmented cell-payload space left by simple deletes. */
+void leaf_node_rebuild(void *node, uint32_t *keys, Record *records,
+                       uint32_t count, uint32_t next_ptr) {
+  uint8_t is_root = *node_is_root_value(node);
+  uint32_t parent_page = *node_parent(node);
+
+  initialize_leaf_node(node);
+  *node_is_root_value(node) = is_root;
+  *node_parent(node) = parent_page;
+  *leaf_node_next_pointer(node) = next_ptr;
+
+  for (uint32_t i = 0; i < count; i++) {
+    uint32_t insertion_point = *leaf_node_free_end(node) - LEAF_NODE_CELL_SIZE;
+    *leaf_node_offset_value(node, (uint16_t)i) = (uint16_t)insertion_point;
+
+    uint8_t *cell = (uint8_t *)node + insertion_point;
+    memcpy(cell, &keys[i], LEAF_NODE_CELL_KEY_SIZE);
+    write_serialized_record(&records[i], cell + LEAF_NODE_CELL_KEY_SIZE);
+
+    *leaf_node_num_cells(node) += 1;
+    *leaf_node_free_start(node) += LEAF_NODE_SLOT_SIZE;
+    *leaf_node_free_end(node) -= LEAF_NODE_CELL_SIZE;
+  }
+}
+
+/* Finds the index of child_page among the children of an internal node.
+   Returns 0..num_keys-1 for pointer[i], or num_keys for the rightmost
+   pointer. Returns -1 if not found (should not happen in a valid tree). */
+int32_t find_child_index_in_parent(void *parent, uint32_t child_page) {
+  uint32_t num_keys = *internal_node_num_keys(parent);
+  for (uint32_t i = 0; i < num_keys; i++) {
+    if (*internal_node_pointer(parent, i) == child_page)
+      return (int32_t)i;
+  }
+  if (*internal_node_rightmost_pointer(parent) == child_page)
+    return (int32_t)num_keys;
+  return -1;
+}
+
+/* Returns the page number of the i-th child of an internal node.
+   child_index = 0..num_keys-1 returns pointer[i];
+   child_index = num_keys returns the rightmost pointer. */
+uint32_t internal_node_child(void *node, uint32_t child_index) {
+  uint32_t num_keys = *internal_node_num_keys(node);
+  if (child_index < num_keys)
+    return *internal_node_pointer(node, child_index);
+  return *internal_node_rightmost_pointer(node);
+}
+
+/* Removes the separator key at key_index and the child pointer to its right
+   from an internal node. Shifts remaining keys/pointers to fill the gap.
+
+   After removal the node has (old_num_keys - 1) keys and correspondingly
+   one fewer child. The caller must check for underflow separately. */
+void internal_node_remove_key(void *node, uint32_t key_index) {
+  uint32_t num_keys = *internal_node_num_keys(node);
+
+  if (key_index == num_keys - 1) {
+    /* Removing the last key: the right child of this key is the rightmost
+       pointer. Replace rightmost with pointer[num_keys-1] (the left child
+       of the removed key). */
+    *internal_node_rightmost_pointer(node) =
+        *internal_node_pointer(node, num_keys - 1);
+  } else {
+    /* Shift keys left to fill the gap at key_index. */
+    for (uint32_t i = key_index; i < num_keys - 1; i++) {
+      *internal_node_key(node, i) = *internal_node_key(node, i + 1);
+    }
+    /* Shift child pointers left: we are removing pointer[key_index + 1]
+       (the right child of the deleted separator). */
+    for (uint32_t i = key_index + 1; i < num_keys - 1; i++) {
+      *internal_node_pointer(node, i) = *internal_node_pointer(node, i + 1);
+    }
+  }
+
+  *internal_node_num_keys(node) = num_keys - 1;
+}
+
+/* When the root internal node has 0 keys and only a single child (the
+   rightmost pointer), copy that child into page 0 to shrink the tree
+   by one level. Updates grandchildren's parent pointers if needed. */
+void collapse_root(Table *table) {
+  void *root = get_page(table->pager, table->root_page_num);
+
+  if (*node_type_value(root) != NODE_TYPE_INTERNAL)
+    return;
+  if (*internal_node_num_keys(root) > 0)
+    return;
+
+  uint32_t child_page_num = *internal_node_rightmost_pointer(root);
+  void *child = get_page(table->pager, child_page_num);
+
+  memcpy(root, child, PAGE_SIZE);
+  *node_is_root_value(root) = 1;
+  *node_parent(root) = 0;
+
+  /* If the promoted child was internal, fix its children's parent ptrs. */
+  if (*node_type_value(root) == NODE_TYPE_INTERNAL) {
+    uint32_t num_keys = *internal_node_num_keys(root);
+    for (uint32_t i = 0; i < num_keys; i++) {
+      void *grandchild =
+          get_page(table->pager, *internal_node_pointer(root, i));
+      *node_parent(grandchild) = table->root_page_num;
+    }
+    void *last = get_page(table->pager, *internal_node_rightmost_pointer(root));
+    *node_parent(last) = table->root_page_num;
+  }
+}
+
+/*
+ Redistribute cells between a leaf node and one of its siblings.
+  Called when a leaf drops below LEAF_NODE_MIN_CELLS but a sibling has
+  more cells than LEAF_NODE_MIN_CELLS (so it can spare one).
+ */
+void leaf_node_redistribute(Pager *pager, uint32_t node_page_num,
+                            uint32_t sibling_page_num, uint32_t separator_index,
+                            int sibling_is_left) {
+  void *node = get_page(pager, node_page_num);
+  void *sibling = get_page(pager, sibling_page_num);
+
+  uint32_t node_keys[LEAF_NODE_MAX_CELLS + 1];
+  Record node_records[LEAF_NODE_MAX_CELLS + 1];
+  uint32_t node_n = leaf_node_read_all_cells(node, node_keys, node_records);
+
+  uint32_t sib_keys[LEAF_NODE_MAX_CELLS];
+  Record sib_records[LEAF_NODE_MAX_CELLS];
+  uint32_t sib_n = leaf_node_read_all_cells(sibling, sib_keys, sib_records);
+
+  /* Move one cell from the sibling to the node. */
+  if (sibling_is_left) {
+    memmove(node_keys + 1, node_keys, node_n * sizeof(uint32_t));
+    memmove(node_records + 1, node_records, node_n * sizeof(Record));
+    node_keys[0] = sib_keys[sib_n - 1];
+    node_records[0] = sib_records[sib_n - 1];
+  } else {
+    node_keys[node_n] = sib_keys[0];
+    node_records[node_n] = sib_records[0];
+    memmove(sib_keys, sib_keys + 1, sib_n * sizeof(uint32_t));
+    memmove(sib_records, sib_records + 1, sib_n * sizeof(Record));
+  }
+  ++node_n;
+  --sib_n;
+
+  /* Rebuild both pages from the modified arrays, redistribution does
+     not change the leaf linked-list order. */
+  uint32_t node_next = *leaf_node_next_pointer(node);
+  uint32_t sib_next = *leaf_node_next_pointer(sibling);
+  leaf_node_rebuild(node, node_keys, node_records, node_n, node_next);
+  leaf_node_rebuild(sibling, sib_keys, sib_records, sib_n, sib_next);
+
+  /* Update the parent's separator key. */
+  void *parent = get_page(pager, *node_parent(node));
+
+  void *left_child = sibling_is_left ? sibling : node;
+  uint32_t left_num_cells = *leaf_node_num_cells(left_child);
+
+  *internal_node_key(parent, separator_index) =
+      leaf_node_key_at_slot(left_child, left_num_cells - 1);
+}
+
+/* Merge the RIGHT leaf into the LEFT leaf */
+void leaf_node_merge(Pager *pager, uint32_t left_page_num,
+                     uint32_t right_page_num, uint32_t separator_index) {
+  void *left_node = get_page(pager, left_page_num);
+  void *right_node = get_page(pager, right_page_num);
+
+  uint32_t left_node_keys[LEAF_NODE_MAX_CELLS + 1];
+  Record left_node_records[LEAF_NODE_MAX_CELLS + 1];
+  uint32_t left_n =
+      leaf_node_read_all_cells(left_node, left_node_keys, left_node_records);
+
+  uint32_t right_node_keys[LEAF_NODE_MAX_CELLS + 1];
+  Record right_node_records[LEAF_NODE_MAX_CELLS + 1];
+  uint32_t right_n =
+      leaf_node_read_all_cells(right_node, right_node_keys, right_node_records);
+
+  uint32_t all_keys[LEAF_NODE_MAX_CELLS + 1];
+  Record all_records[LEAF_NODE_MAX_CELLS + 1];
+
+  for (uint32_t i = 0; i < left_n + right_n; ++i) {
+    if (i < left_n) {
+      all_keys[i] = left_node_keys[i];
+      all_records[i] = left_node_records[i];
+    } else {
+      all_keys[i] = right_node_keys[i - left_n];
+      all_records[i] = right_node_records[i - left_n];
+    }
+  }
+
+  uint32_t next_ptr = *leaf_node_next_pointer(right_node);
+  leaf_node_rebuild(left_node, all_keys, all_records, left_n + right_n,
+                    next_ptr);
+
+  void *parent = get_page(pager, *node_parent(left_node));
+  internal_node_remove_key(parent, separator_index);
+}
+
+/* Handle underflow after a deletion causes a node to drop below
+   minimum occupancy. Currently supports leaf-level rebalancing only. */
+void handle_underflow(Pager *pager, Table *table, uint32_t page_num) {
+  void *node = get_page(pager, page_num);
+
+  if (*node_is_root_value(node)) {
+    if (*node_type_value(node) == NODE_TYPE_LEAF)
+      return;
+    else
+      collapse_root(table);
+    return;
+  }
+
+  uint32_t parent_page = *node_parent(node);
+  void *parent = get_page(pager, parent_page);
+  int32_t child_idx = find_child_index_in_parent(parent, page_num);
+  uint32_t num_parent_keys = *internal_node_num_keys(parent);
+
+  /* Identify siblings. Not every node has both. */
+  int has_left = (child_idx > 0);
+  int has_right = ((uint32_t)child_idx < num_parent_keys);
+
+  uint32_t left_sib_page = 0, right_sib_page = 0;
+  uint32_t left_sep = 0, right_sep = 0;
+
+  if (has_left) {
+    left_sib_page = internal_node_child(parent, child_idx - 1);
+    left_sep = child_idx - 1;
+  }
+  if (has_right) {
+    right_sib_page = internal_node_child(parent, child_idx + 1);
+    right_sep = child_idx;
+  }
+
+  if (*node_type_value(node) == NODE_TYPE_LEAF) {
+    /* Try redistribute first: pick a sibling above minimum. */
+    if (has_left &&
+        *leaf_node_num_cells(get_page(pager, left_sib_page)) >
+            LEAF_NODE_MIN_CELLS) {
+      leaf_node_redistribute(pager, page_num, left_sib_page, left_sep, 1);
+      return;
+    }
+    if (has_right &&
+        *leaf_node_num_cells(get_page(pager, right_sib_page)) >
+            LEAF_NODE_MIN_CELLS) {
+      leaf_node_redistribute(pager, page_num, right_sib_page, right_sep, 0);
+      return;
+    }
+
+    /* No sibling can spare — merge. Convention: left receives, right is
+       discarded. Decide which role the underflowed node plays. */
+    if (has_left) {
+      leaf_node_merge(pager, left_sib_page, page_num, left_sep);
+    } else {
+      leaf_node_merge(pager, page_num, right_sib_page, right_sep);
+    }
+  }
+
+  /* TODO: add internal-node redistribute / merge here later. */
+
+  /* After a merge the parent lost a key — check for parent underflow. */
+  uint32_t parent_keys = *internal_node_num_keys(parent);
+  if (*node_is_root_value(parent) && parent_keys == 0)
+    collapse_root(table);
+  else if (!*node_is_root_value(parent) &&
+           parent_keys < INTERNAL_NODE_MIN_KEYS)
+    handle_underflow(pager, table, parent_page);
+}
+
 void execute_delete(Statement *statement, Table *table) {
   uint32_t key = statement->id_to_delete;
 
@@ -886,30 +1170,26 @@ void execute_delete(Statement *statement, Table *table) {
   Cursor *cursor = find_key_cursor(table, key, &key_exists);
   if (!key_exists) {
     printf("Key %d does not exist\n", key);
+    free(cursor);
     return;
   }
 
-  /*
-  From SQLite design system:
-  Suppose the key value is there , and i be the corresponding index at the
-  entries. All entries with index greater than i are moved down one element. If
-  the number of remaining entries does not fall below the lower bound of page
-  occupancy, the delete terminates then and there . Suppose the leaf occupancy
-  falls below the lower bound. We need to restructure the tree (by merging
-  sibling nodes) bottom up starting from this node.
-
-  We do the following until the restructuring process terminates
-
-  For now, we are going to suppose the leaf occupancy never leaves the lower
-  bound.
-  */
   void *node = get_page(table->pager, cursor->page_num);
   uint32_t num_cells = *leaf_node_num_cells(node);
+  uint32_t deleted_page = cursor->page_num;
+
+  /* Remove the slot entry by shifting later slots left. */
   for (uint32_t i = cursor->slot_num + 1; i < num_cells; ++i) {
     *leaf_node_offset_value(node, i - 1) = *leaf_node_offset_value(node, i);
   }
   *leaf_node_num_cells(node) -= 1;
   *leaf_node_free_start(node) -= LEAF_NODE_SLOT_SIZE;
+
+  /* Check for underflow: non-root leaf dropped below minimum occupancy. */
+  if (!*node_is_root_value(node) &&
+      *leaf_node_num_cells(node) < LEAF_NODE_MIN_CELLS) {
+    handle_underflow(table->pager, table, deleted_page);
+  }
 
   free(cursor);
 }
