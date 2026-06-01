@@ -64,12 +64,51 @@ typedef struct {
   uint32_t id_to_delete;
 } Statement;
 
+typedef enum { COMMIT, CHECKPOINT, PAGE_CHANGE } WALEntryType;
+
+/* In-memory view of one WAL record's fixed header. Payload is handled
+ * separately */
+typedef struct {
+  WALEntryType type;
+  uint32_t checksum;
+  uint32_t lsn;
+  uint32_t txid;
+  uint32_t page_num;
+  uint32_t length;
+} WALEntry;
+
+// WAL on-disk header layout
+const uint32_t WAL_CHECKSUM_SIZE = sizeof(uint32_t);
+const uint32_t WAL_CHECKSUM_OFFSET = 0;
+const uint8_t WAL_TYPE_SIZE = sizeof(uint8_t);
+const uint32_t WAL_TYPE_OFFSET = WAL_CHECKSUM_OFFSET + WAL_TYPE_SIZE;
+const off_t WAL_LSN_SIZE = sizeof(off_t);
+const uint32_t WAL_LSN_OFFSET = WAL_TYPE_OFFSET + WAL_LSN_SIZE;
+const uint32_t WAL_TXID_SIZE = sizeof(uint32_t);
+const uint32_t WAL_TXID_OFFSET = WAL_LSN_OFFSET + WAL_TXID_SIZE;
+const uint32_t WAL_PAGE_NUM_SIZE = sizeof(uint32_t);
+const uint32_t WAL_PAGE_NUM_OFFSET = WAL_TXID_OFFSET + WAL_PAGE_NUM_SIZE;
+const uint32_t WAL_LENGTH_SIZE = sizeof(uint32_t);
+const uint32_t WAL_LENGTH_OFFSET = WAL_PAGE_NUM_OFFSET + WAL_LENGTH_SIZE;
+const uint32_t WAL_COMMON_HEADER_SIZE = WAL_CHECKSUM_SIZE + WAL_TYPE_SIZE +
+                                        WAL_LSN_SIZE + WAL_PAGE_NUM_SIZE +
+                                        WAL_LENGTH_SIZE;
+
+typedef struct {
+  off_t file_length;
+  char *filename;
+  int fd;
+  uint32_t curr_txid;
+} WAL;
+
 typedef struct {
   void *pages[TABLE_MAX_PAGES];
+  uint8_t dirty[TABLE_MAX_PAGES];
   off_t file_length;
   uint32_t num_pages;
   char *filename;
   int fd;
+  WAL *wal;
 } Pager;
 
 typedef struct {
@@ -211,9 +250,81 @@ uint32_t leaf_node_key_at_slot(void *node, uint32_t slot_num) {
   return key;
 }
 
-typedef struct {
-  Pager *pager;
-} BTree;
+// Opens or creates the WAL file.
+WAL *new_wal(char *db_filename) {
+  size_t len = strlen(db_filename) + 4 + 1;
+  char *wal_filename = malloc(len);
+  if (!wal_filename)
+    return NULL;
+
+  snprintf(wal_filename, len, "%s-wal", db_filename);
+
+  int fd = open(wal_filename, O_RDWR | O_CREAT, S_IWUSR | S_IRUSR);
+  if (fd == -1) {
+    printf("Unable to open WAL file\n");
+    exit(EXIT_FAILURE);
+  }
+
+  off_t file_length = lseek(fd, 0, SEEK_END);
+
+  WAL *wal = (WAL *)malloc(sizeof(WAL));
+  wal->fd = fd;
+  wal->filename = wal_filename;
+  wal->file_length = file_length;
+  wal->curr_txid = 0;
+
+  return wal;
+}
+
+void write_serialized_wal_entry(WALEntry *source, void *destination) {
+  memcpy(destination + WAL_TYPE_OFFSET, &(source->type), WAL_TYPE_SIZE);
+  memcpy(destination + WAL_LSN_OFFSET, &(source->lsn), WAL_LSN_SIZE);
+  memcpy(destination + WAL_TXID_OFFSET, &(source->txid), WAL_TXID_SIZE);
+  memcpy(destination + WAL_PAGE_NUM_OFFSET, &(source->page_num),
+         WAL_PAGE_NUM_SIZE);
+  memcpy(destination + WAL_LENGTH_OFFSET, &(source->length), WAL_LENGTH_SIZE);
+  memcpy(destination + WAL_CHECKSUM_OFFSET, &(source->checksum),
+         WAL_CHECKSUM_SIZE);
+}
+
+void read_deserialized_wal_entry(void *source, WALEntry *destination) {
+  memcpy(&(destination->type), source + WAL_TYPE_OFFSET, WAL_TYPE_SIZE);
+  memcpy(&(destination->lsn), source + WAL_LSN_OFFSET, WAL_LSN_SIZE);
+  memcpy(&(destination->txid), source + WAL_TXID_OFFSET, WAL_TXID_SIZE);
+  memcpy(&(destination->page_num), source + WAL_PAGE_NUM_OFFSET,
+         WAL_PAGE_NUM_SIZE);
+  memcpy(&(destination->length), source + WAL_LENGTH_OFFSET, WAL_LENGTH_SIZE);
+  memcpy(&(destination->checksum), source + WAL_CHECKSUM_OFFSET,
+         WAL_CHECKSUM_SIZE);
+}
+
+/* Appends ONE page-change record to the WAL. Returns the LSN the
+ record was written at. */
+uint32_t wal_append_page(WAL *wal, uint32_t txid, uint32_t page_num,
+                         void *page_image) {
+  WALEntry *entry;
+  entry->lsn = wal->file_length;
+  entry->txid = txid;
+  entry->type = PAGE_CHANGE;
+  entry->length = PAGE_SIZE;
+  entry->page_num = page_num;
+
+  // TODO: complete
+  wal->file_length += WAL_COMMON_HEADER_SIZE + PAGE_SIZE;
+
+  return 0;
+}
+
+/* Writes the COMMIT record for txid and issues the single fsync that makes
+ the whole transaction durable. */
+void wal_commit(WAL *wal, uint32_t txid) {}
+
+/* Frees WAL resources. */
+void wal_close(WAL *wal) {
+  close(wal->fd);
+  free(wal->filename);
+  free(wal);
+}
 
 /* Opens or creates the database file and initializes pager metadata. */
 Pager *new_pager(char *filename) {
@@ -227,16 +338,22 @@ Pager *new_pager(char *filename) {
   off_t file_length = lseek(fd, 0, SEEK_END);
 
   Pager *pager = (Pager *)malloc(sizeof(Pager));
+  pager->wal = new_wal(filename);
   pager->fd = fd;
   pager->filename = filename;
   pager->file_length = file_length;
   pager->num_pages = file_length / LEAF_NODE_SIZE;
 
-  for (uint32_t i = 0; i < TABLE_MAX_PAGES; i++)
+  for (uint32_t i = 0; i < TABLE_MAX_PAGES; i++) {
     pager->pages[i] = NULL;
+    pager->dirty[i] = 0;
+  }
 
   return pager;
 }
+
+/* Marks page page_num dirty so it will be logged at the next commit. */
+void pager_mark_dirty(Pager *pager, uint32_t page_num) {}
 
 /* Writes a single in-memory page back to disk at its page-aligned offset. */
 void flush_page(Pager *pager, uint32_t num_page) {
@@ -910,6 +1027,8 @@ ExecuteStatus execute_insert(Statement *statement, Table *table) {
   }
 
   leaf_node_insert(cursor, record.id, &record);
+
+  // TODO: log dirty pages, then wal_commit, then clear dirty flags.
 
   free(cursor);
   return EXECUTE_SUCCESS;
