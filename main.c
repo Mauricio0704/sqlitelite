@@ -71,7 +71,7 @@ typedef enum { COMMIT, CHECKPOINT, PAGE_CHANGE } WALEntryType;
 typedef struct {
   WALEntryType type;
   uint32_t checksum;
-  uint32_t lsn;
+  off_t lsn;
   uint32_t txid;
   uint32_t page_num;
   uint32_t length;
@@ -298,24 +298,39 @@ void read_deserialized_wal_entry(void *source, WALEntry *destination) {
 
 /* Appends ONE page-change record to the WAL. Returns the LSN the
  record was written at. */
-uint32_t wal_append_page(WAL *wal, uint32_t txid, uint32_t page_num,
-                         void *page_image) {
-  WALEntry *entry;
-  entry->lsn = wal->file_length;
-  entry->txid = txid;
-  entry->type = PAGE_CHANGE;
-  entry->length = PAGE_SIZE;
-  entry->page_num = page_num;
+off_t wal_append_page(WAL *wal, uint32_t txid, uint32_t page_num,
+                      void *page_image) {
+  WALEntry entry;
+  entry.lsn = wal->file_length;
+  entry.txid = txid;
+  entry.type = PAGE_CHANGE;
+  entry.length = PAGE_SIZE;
+  entry.page_num = page_num;
 
-  // TODO: complete
+  write_serialized_wal_entry(&entry, (void *)wal->file_length);
+
+  off_t lsn = wal->file_length;
   wal->file_length += WAL_COMMON_HEADER_SIZE + PAGE_SIZE;
 
-  return 0;
+  return lsn;
 }
 
 /* Writes the COMMIT record for txid and issues the single fsync that makes
  the whole transaction durable. */
-void wal_commit(WAL *wal, uint32_t txid) {}
+void wal_commit(WAL *wal, uint32_t txid) {
+  WALEntry entry;
+  entry.lsn = wal->file_length;
+  entry.txid = txid;
+  entry.type = COMMIT;
+  entry.length = 0;
+  entry.page_num = -1;
+
+  write_serialized_wal_entry(&entry, (void *)wal->file_length);
+  fsync(wal->fd);
+
+  off_t lsn = wal->file_length;
+  wal->file_length += WAL_COMMON_HEADER_SIZE;
+}
 
 /* Frees WAL resources. */
 void wal_close(WAL *wal) {
@@ -351,7 +366,13 @@ Pager *new_pager(char *filename) {
 }
 
 /* Marks page page_num dirty so it will be logged at the next commit. */
-void pager_mark_dirty(Pager *pager, uint32_t page_num) {}
+void pager_mark_dirty(Pager *pager, uint32_t page_num) {
+  if (page_num >= TABLE_MAX_PAGES) {
+    printf("Trying to mark as dirty a page out of bounds: %d", page_num);
+    return;
+  }
+  pager->dirty[page_num] = 1;
+}
 
 /* Writes a single in-memory page back to disk at its page-aligned offset. */
 void flush_page(Pager *pager, uint32_t num_page) {
@@ -723,6 +744,10 @@ void internal_node_split(Pager *pager, uint32_t node_page_num, uint32_t new_key,
 
     void *left_node = get_page(pager, left_page_num);
     void *right_node = get_page(pager, right_page_num);
+
+    pager_mark_dirty(pager, left_page_num);
+    pager_mark_dirty(pager, right_page_num);
+
     initialize_internal_node(left_node);
     initialize_internal_node(right_node);
 
@@ -743,6 +768,7 @@ void internal_node_split(Pager *pager, uint32_t node_page_num, uint32_t new_key,
 
     *node_parent(left_node) = node_page_num;
     *node_parent(right_node) = node_page_num;
+    pager_mark_dirty(pager, node_page_num);
 
     for (uint32_t i = 0; i <= left_num_keys; i++) {
       uint32_t child_page = (i < left_num_keys)
@@ -769,6 +795,7 @@ void internal_node_split(Pager *pager, uint32_t node_page_num, uint32_t new_key,
     uint32_t right_page_num = pager->num_pages;
     pager->num_pages += 1;
     void *right_node = get_page(pager, right_page_num);
+    pager_mark_dirty(pager, right_page_num);
     initialize_internal_node(right_node);
 
     /* Rebuild the original node as the left half. */
@@ -898,6 +925,9 @@ void leaf_node_split(Cursor *cursor, void *node, uint32_t key, Record *record) {
   *leaf_node_next_pointer(left_page) = right_page_num;
   *leaf_node_next_pointer(right_page) = old_next;
 
+  pager_mark_dirty(pager, left_page_num);
+  pager_mark_dirty(pager, right_page_num);
+
   if (!was_root) {
     *node_parent(left_page) = old_parent_page_num;
     *node_parent(right_page) = old_parent_page_num;
@@ -905,6 +935,8 @@ void leaf_node_split(Cursor *cursor, void *node, uint32_t key, Record *record) {
     void *parent_node = get_page(pager, old_parent_page_num);
     uint32_t separator_key =
         leaf_node_key_at_slot(left_page, *leaf_node_num_cells(left_page) - 1);
+
+    pager_mark_dirty(pager, old_parent_page_num);
 
     if (*internal_node_num_keys(parent_node) >= INTERNAL_NODE_MAX_KEYS) {
       internal_node_split(pager, old_parent_page_num, separator_key,
@@ -926,6 +958,8 @@ void leaf_node_split(Cursor *cursor, void *node, uint32_t key, Record *record) {
     *internal_node_rightmost_pointer(node) = right_page_num;
     *internal_node_key(node, 0) =
         leaf_node_key_at_slot(left_page, *leaf_node_num_cells(left_page) - 1);
+
+    pager_mark_dirty(pager, root_page_num);
   }
 }
 
@@ -961,6 +995,8 @@ void leaf_node_insert(Cursor *cursor, uint32_t key, Record *record) {
   uint8_t *cell = (uint8_t *)node + insertion_point;
   memcpy(cell, &key, LEAF_NODE_CELL_KEY_SIZE);
   write_serialized_record(record, cell + LEAF_NODE_CELL_KEY_SIZE);
+
+  pager_mark_dirty(cursor->table->pager, cursor->page_num);
 }
 
 /* Reads and prints the record currently addressed by the cursor. */
@@ -1012,6 +1048,16 @@ Cursor *find_key_cursor(Table *table, uint32_t key, int *key_exists) {
   return leaf_cursor;
 }
 
+void flush_to_wal(Pager *pager) {
+  for (int i = 0; i < TABLE_MAX_PAGES; i++) {
+    if (pager->dirty[i] != 0) {
+      wal_append_page(pager->wal, pager->wal->curr_txid, i, pager->pages[i]);
+    }
+  }
+  wal_commit(pager->wal, pager->wal->curr_txid);
+  pager->wal->curr_txid++;
+}
+
 /* Inserts a record into the B-tree, redistributing nodes and updating parent
  keys as needed.*/
 ExecuteStatus execute_insert(Statement *statement, Table *table) {
@@ -1026,7 +1072,7 @@ ExecuteStatus execute_insert(Statement *statement, Table *table) {
 
   leaf_node_insert(cursor, record.id, &record);
 
-  // TODO: log dirty pages, then wal_commit, then clear dirty flags.
+  flush_to_wal(table->pager);
 
   free(cursor);
   return EXECUTE_SUCCESS;
