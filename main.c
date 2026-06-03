@@ -745,15 +745,15 @@ void internal_node_split(Pager *pager, uint32_t node_page_num, uint32_t new_key,
     *node_parent(right_node) = node_page_num;
 
     for (uint32_t i = 0; i <= left_num_keys; i++) {
-      uint32_t child_page =
-          (i < left_num_keys) ? *internal_node_pointer(left_node, i)
-                              : *internal_node_rightmost_pointer(left_node);
+      uint32_t child_page = (i < left_num_keys)
+                                ? *internal_node_pointer(left_node, i)
+                                : *internal_node_rightmost_pointer(left_node);
       *node_parent(get_page(pager, child_page)) = left_page_num;
     }
     for (uint32_t i = 0; i <= right_num_keys; i++) {
-      uint32_t child_page =
-          (i < right_num_keys) ? *internal_node_pointer(right_node, i)
-                               : *internal_node_rightmost_pointer(right_node);
+      uint32_t child_page = (i < right_num_keys)
+                                ? *internal_node_pointer(right_node, i)
+                                : *internal_node_rightmost_pointer(right_node);
       *node_parent(get_page(pager, child_page)) = right_page_num;
     }
 
