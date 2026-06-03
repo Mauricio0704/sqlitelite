@@ -81,18 +81,16 @@ typedef struct {
 const uint32_t WAL_CHECKSUM_SIZE = sizeof(uint32_t);
 const uint32_t WAL_CHECKSUM_OFFSET = 0;
 const uint8_t WAL_TYPE_SIZE = sizeof(uint8_t);
-const uint32_t WAL_TYPE_OFFSET = WAL_CHECKSUM_OFFSET + WAL_TYPE_SIZE;
+const uint32_t WAL_TYPE_OFFSET = WAL_CHECKSUM_OFFSET + WAL_CHECKSUM_SIZE;
 const off_t WAL_LSN_SIZE = sizeof(off_t);
-const uint32_t WAL_LSN_OFFSET = WAL_TYPE_OFFSET + WAL_LSN_SIZE;
+const uint32_t WAL_LSN_OFFSET = WAL_TYPE_OFFSET + WAL_TYPE_SIZE;
 const uint32_t WAL_TXID_SIZE = sizeof(uint32_t);
-const uint32_t WAL_TXID_OFFSET = WAL_LSN_OFFSET + WAL_TXID_SIZE;
+const uint32_t WAL_TXID_OFFSET = WAL_LSN_OFFSET + WAL_LSN_SIZE;
 const uint32_t WAL_PAGE_NUM_SIZE = sizeof(uint32_t);
-const uint32_t WAL_PAGE_NUM_OFFSET = WAL_TXID_OFFSET + WAL_PAGE_NUM_SIZE;
+const uint32_t WAL_PAGE_NUM_OFFSET = WAL_TXID_OFFSET + WAL_TXID_SIZE;
 const uint32_t WAL_LENGTH_SIZE = sizeof(uint32_t);
-const uint32_t WAL_LENGTH_OFFSET = WAL_PAGE_NUM_OFFSET + WAL_LENGTH_SIZE;
-const uint32_t WAL_COMMON_HEADER_SIZE = WAL_CHECKSUM_SIZE + WAL_TYPE_SIZE +
-                                        WAL_LSN_SIZE + WAL_PAGE_NUM_SIZE +
-                                        WAL_LENGTH_SIZE;
+const uint32_t WAL_LENGTH_OFFSET = WAL_PAGE_NUM_OFFSET + WAL_PAGE_NUM_SIZE;
+const uint32_t WAL_COMMON_HEADER_SIZE = WAL_LENGTH_OFFSET + WAL_LENGTH_SIZE;
 
 typedef struct {
   off_t file_length;
@@ -794,24 +792,24 @@ void internal_node_split(Pager *pager, uint32_t node_page_num, uint32_t new_key,
 
     /* Update children's parent pointers. */
     for (uint32_t i = 0; i <= left_num_keys; i++) {
-      uint32_t child_page =
-          (i < left_num_keys) ? *internal_node_pointer(node, i)
-                              : *internal_node_rightmost_pointer(node);
+      uint32_t child_page = (i < left_num_keys)
+                                ? *internal_node_pointer(node, i)
+                                : *internal_node_rightmost_pointer(node);
       *node_parent(get_page(pager, child_page)) = node_page_num;
     }
     *node_parent(right_node) = old_parent_page;
     for (uint32_t i = 0; i <= right_num_keys; i++) {
-      uint32_t child_page =
-          (i < right_num_keys) ? *internal_node_pointer(right_node, i)
-                               : *internal_node_rightmost_pointer(right_node);
+      uint32_t child_page = (i < right_num_keys)
+                                ? *internal_node_pointer(right_node, i)
+                                : *internal_node_rightmost_pointer(right_node);
       *node_parent(get_page(pager, child_page)) = right_page_num;
     }
 
     /* Insert promoted key into parent. */
     void *parent = get_page(pager, old_parent_page);
     if (*internal_node_num_keys(parent) >= INTERNAL_NODE_MAX_KEYS) {
-      internal_node_split(pager, old_parent_page, promoted_key,
-                          node_page_num, right_page_num);
+      internal_node_split(pager, old_parent_page, promoted_key, node_page_num,
+                          right_page_num);
     } else {
       internal_node_insert_key(pager, old_parent_page, promoted_key,
                                node_page_num, right_page_num);
