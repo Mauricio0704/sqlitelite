@@ -296,6 +296,16 @@ void read_deserialized_wal_entry(void *source, WALEntry *destination) {
          WAL_CHECKSUM_SIZE);
 }
 
+/* Additive byte-sum over length bytes, used to detect torn/corrupt records. */
+uint32_t wal_checksum(void *data, uint32_t length) {
+  uint32_t sum = 0;
+  uint8_t *bytes = (uint8_t *)data;
+  for (uint32_t i = 0; i < length; i++) {
+    sum += bytes[i];
+  }
+  return sum;
+}
+
 /* Appends ONE page-change record to the WAL. Returns the LSN the
  record was written at. */
 off_t wal_append_page(WAL *wal, uint32_t txid, uint32_t page_num,
@@ -307,10 +317,22 @@ off_t wal_append_page(WAL *wal, uint32_t txid, uint32_t page_num,
   entry.length = PAGE_SIZE;
   entry.page_num = page_num;
 
-  write_serialized_wal_entry(&entry, (void *)wal->file_length);
+  uint8_t *wal_record = malloc(WAL_COMMON_HEADER_SIZE);
+  write_serialized_wal_entry(&entry, wal_record);
+
+  uint32_t checksum = wal_checksum(wal_record + WAL_CHECKSUM_SIZE,
+                                   WAL_COMMON_HEADER_SIZE - WAL_CHECKSUM_SIZE) +
+                      wal_checksum(page_image, PAGE_SIZE);
+  memcpy(wal_record + WAL_CHECKSUM_OFFSET, &checksum, WAL_CHECKSUM_SIZE);
+
+  pwrite(wal->fd, wal_record, WAL_COMMON_HEADER_SIZE, wal->file_length);
+  pwrite(wal->fd, page_image, PAGE_SIZE,
+         wal->file_length + WAL_COMMON_HEADER_SIZE);
 
   off_t lsn = wal->file_length;
   wal->file_length += WAL_COMMON_HEADER_SIZE + PAGE_SIZE;
+
+  free(wal_record);
 
   return lsn;
 }
@@ -325,10 +347,19 @@ void wal_commit(WAL *wal, uint32_t txid) {
   entry.length = 0;
   entry.page_num = -1;
 
-  write_serialized_wal_entry(&entry, (void *)wal->file_length);
+  uint8_t *wal_record = malloc(WAL_COMMON_HEADER_SIZE);
+
+  write_serialized_wal_entry(&entry, wal_record);
+
+  /* Header-only record: checksum covers the header minus the checksum field. */
+  uint32_t checksum = wal_checksum(wal_record + WAL_CHECKSUM_SIZE,
+                                   WAL_COMMON_HEADER_SIZE - WAL_CHECKSUM_SIZE);
+  memcpy(wal_record + WAL_CHECKSUM_OFFSET, &checksum, WAL_CHECKSUM_SIZE);
+
+  pwrite(wal->fd, wal_record, WAL_COMMON_HEADER_SIZE, wal->file_length);
   fsync(wal->fd);
 
-  off_t lsn = wal->file_length;
+  free(wal_record);
   wal->file_length += WAL_COMMON_HEADER_SIZE;
 }
 
@@ -1052,6 +1083,7 @@ void flush_to_wal(Pager *pager) {
   for (int i = 0; i < TABLE_MAX_PAGES; i++) {
     if (pager->dirty[i] != 0) {
       wal_append_page(pager->wal, pager->wal->curr_txid, i, pager->pages[i]);
+      pager->dirty[i] = 0;
     }
   }
   wal_commit(pager->wal, pager->wal->curr_txid);
