@@ -592,6 +592,98 @@ class TestDeleteUnderflow(DBTestCase):
         ids = [int(r.split(",")[0].strip("( ")) for r in rows]
         self.assertEqual(ids, list(range(2, n + 1, 2)))
 
+class TestWALRecovery(DBTestCase):
+    """Write-Ahead Log recovery after a simulated crash.
+
+    A 'crash' here means the process dies WITHOUT a clean `.exit`. The REPL
+    only flushes pages to the .db file in close_db (on `.exit`); on EOF it
+    calls exit(EXIT_FAILURE) and never flushes. So feeding commands without a
+    trailing `.exit` leaves the .db untouched and only the fsync'd WAL on disk
+    — meaning anything recovered on the next open came from the WAL alone.
+    """
+
+    def wal_path(self) -> str:
+        return self.db + "-wal"
+
+    def tearDown(self):
+        super().tearDown()
+        if os.path.exists(self.wal_path()):
+            os.unlink(self.wal_path())
+
+    # -- helpers -----------------------------------------------------------
+
+    def crash(self, commands: list[str]) -> None:
+        """Run commands with NO `.exit`. The binary processes (and fsyncs) every
+        command, then dies on EOF before flushing pages to the .db file."""
+        run_db(commands, self.db)
+
+    def reopen_ids(self) -> list[int]:
+        """Reopen cleanly, select everything, return the recovered key ids."""
+        lines = strip_prompts(run_db(["select", ".exit"], self.db))
+        rows = [l for l in lines if l.startswith("(")]
+        return [int(r.split(",")[0].strip("( ")) for r in rows]
+
+    @staticmethod
+    def _inserts(lo: int, hi: int) -> list[str]:
+        return [f"insert {i} user{i} u{i}@x.com" for i in range(lo, hi)]
+
+    # -- tests -------------------------------------------------------------
+
+    def test_committed_inserts_survive_crash(self):
+        self.crash(["insert 1 alice a@x.com", "insert 2 bob b@x.com"])
+        # Nothing was flushed to .db: recovery must restore from the WAL alone.
+        self.assertEqual(os.path.getsize(self.db), 0)
+        self.assertEqual(self.reopen_ids(), [1, 2])
+
+    def test_recovery_restores_all_rows_after_split(self):
+        # 14 rows force a leaf split (multi-page transaction in the WAL).
+        self.crash(self._inserts(1, 15))
+        self.assertEqual(self.reopen_ids(), list(range(1, 15)))
+
+    def test_committed_deletes_survive_crash(self):
+        # Insert 14 (forces a split), delete 1..7, then crash before flush.
+        self.crash(self._inserts(1, 15) + [f"delete {i}" for i in range(1, 8)])
+        self.assertEqual(self.reopen_ids(), list(range(8, 15)))
+
+    def test_recovery_is_idempotent_across_reopens(self):
+        self.crash(["insert 1 a a@x.com", "insert 2 b b@x.com",
+                    "insert 3 c c@x.com"])
+        # Recovery runs on every open and the WAL is never truncated, so
+        # replaying it repeatedly must keep producing the same state.
+        self.assertEqual(self.reopen_ids(), [1, 2, 3])
+        self.assertEqual(self.reopen_ids(), [1, 2, 3])
+
+    def test_garbage_tail_in_wal_is_ignored(self):
+        self.crash(["insert 1 a a@x.com", "insert 2 b b@x.com"])
+        # Append bytes that cannot parse as a valid record (bad type/length).
+        with open(self.wal_path(), "ab") as f:
+            f.write(b"\xff" * 100)
+        # Recovery stops at the unparseable tail; valid records still applied.
+        self.assertEqual(self.reopen_ids(), [1, 2])
+
+    def test_corrupted_payload_detected_by_checksum(self):
+        self.crash(["insert 1 a a@x.com", "insert 2 b b@x.com"])
+        size = os.path.getsize(self.wal_path())
+        # Flip a byte deep inside the SECOND record's page payload (100 bytes
+        # from EOF lands well inside it; the trailing commit record is ~25B).
+        with open(self.wal_path(), "r+b") as f:
+            f.seek(size - 100)
+            original = f.read(1)
+            f.seek(size - 100)
+            f.write(bytes([original[0] ^ 0xFF]))
+        # The 2nd record fails its checksum, so recovery stops there: only the
+        # first transaction survives.
+        self.assertEqual(self.reopen_ids(), [1])
+
+    def test_torn_commit_record_discards_its_transaction(self):
+        self.crash(["insert 1 a a@x.com", "insert 2 b b@x.com"])
+        size = os.path.getsize(self.wal_path())
+        # Chop the tail so the final COMMIT record is incomplete. Its
+        # transaction's page-change is buffered but never committed -> dropped.
+        with open(self.wal_path(), "r+b") as f:
+            f.truncate(size - 10)
+        self.assertEqual(self.reopen_ids(), [1])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
