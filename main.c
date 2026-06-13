@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/types.h>
 #include <unistd.h>
 
 #define TABLE_MAX_PAGES 100
@@ -363,6 +364,66 @@ void wal_commit(WAL *wal, uint32_t txid) {
   wal->file_length += WAL_COMMON_HEADER_SIZE;
 }
 
+void wal_clean(WAL *wal) {
+  ftruncate(wal->fd, 0);
+  lseek(wal->fd, 0, SEEK_SET);
+}
+
+void wal_recover(Pager *pager) {
+  uint8_t *header = malloc(WAL_COMMON_HEADER_SIZE);
+  uint8_t *payload = malloc(PAGE_SIZE);
+  off_t wal_offset = 0;
+
+  while (1) {
+    ssize_t n =
+        pread(pager->wal->fd, header, WAL_COMMON_HEADER_SIZE, wal_offset);
+    if (n < (ssize_t)WAL_COMMON_HEADER_SIZE) {
+      break;
+    }
+
+    WALEntry entry = {0};
+    read_deserialized_wal_entry(header, &entry);
+
+    // Length must match the record type
+    uint32_t expected_length;
+    if (entry.type == PAGE_CHANGE) {
+      expected_length = PAGE_SIZE;
+    } else if (entry.type == COMMIT) {
+      expected_length = 0;
+    } else {
+      break;
+    }
+    if (entry.length != expected_length) {
+      break;
+    }
+
+    if (entry.length > 0) {
+      n = pread(pager->wal->fd, payload, entry.length,
+                wal_offset + WAL_COMMON_HEADER_SIZE);
+      if (n < (ssize_t)entry.length) {
+        break;
+      }
+    }
+
+    // Recompute the checksum exactly as it was written
+    uint32_t computed = wal_checksum(
+        header + WAL_CHECKSUM_SIZE, WAL_COMMON_HEADER_SIZE - WAL_CHECKSUM_SIZE);
+    if (entry.length > 0) {
+      computed += wal_checksum(payload, entry.length);
+    }
+    if (computed != entry.checksum) {
+      break;
+    }
+
+    /* TODO */
+
+    wal_offset += WAL_COMMON_HEADER_SIZE + entry.length;
+  }
+
+  free(header);
+  free(payload);
+}
+
 /* Frees WAL resources. */
 void wal_close(WAL *wal) {
   close(wal->fd);
@@ -579,6 +640,8 @@ Cursor *leaf_node_offset_find(Table *table, uint32_t page_num, uint32_t key) {
 /* Opens the database file and ensures the root page is initialized. */
 Table *open_db(char *filename) {
   Pager *pager = new_pager(filename);
+
+  wal_recover(pager);
 
   Table *new_table = (Table *)malloc(sizeof(Table));
   new_table->pager = pager;
