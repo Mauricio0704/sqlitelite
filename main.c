@@ -91,7 +91,7 @@ const uint32_t WAL_PAGE_NUM_SIZE = sizeof(uint32_t);
 const uint32_t WAL_PAGE_NUM_OFFSET = WAL_TXID_OFFSET + WAL_TXID_SIZE;
 const uint32_t WAL_LENGTH_SIZE = sizeof(uint32_t);
 const uint32_t WAL_LENGTH_OFFSET = WAL_PAGE_NUM_OFFSET + WAL_PAGE_NUM_SIZE;
-const uint32_t WAL_COMMON_HEADER_SIZE = WAL_LENGTH_OFFSET + WAL_LENGTH_SIZE;
+enum { WAL_COMMON_HEADER_SIZE = WAL_LENGTH_OFFSET + WAL_LENGTH_SIZE };
 
 typedef struct {
   off_t file_length;
@@ -370,9 +370,24 @@ void wal_clean(WAL *wal) {
 }
 
 void wal_recover(Pager *pager) {
-  uint8_t *header = malloc(WAL_COMMON_HEADER_SIZE);
-  uint8_t *payload = malloc(PAGE_SIZE);
+  uint8_t header[WAL_COMMON_HEADER_SIZE];
+  uint8_t payload[PAGE_SIZE];
   off_t wal_offset = 0;
+
+  typedef struct {
+    uint32_t page_num;
+    uint8_t image[PAGE_SIZE];
+  } BufferedPage;
+
+  struct PagesBuffer {
+    ssize_t size;
+    ssize_t capacity;
+    BufferedPage *bufferedPages;
+  } PageBuffer;
+
+  PageBuffer.size = 0;
+  PageBuffer.capacity = 2;
+  PageBuffer.bufferedPages = malloc(2 * sizeof(BufferedPage));
 
   while (1) {
     ssize_t n =
@@ -415,13 +430,40 @@ void wal_recover(Pager *pager) {
       break;
     }
 
-    /* TODO */
+    if (entry.type == COMMIT) {
+      for (int i = 0; i < PageBuffer.size; i++) {
+        uint32_t page_num = PageBuffer.bufferedPages[i].page_num;
+        void *image = PageBuffer.bufferedPages[i].image;
+        pwrite(pager->fd, image, PAGE_SIZE, PAGE_SIZE * page_num);
+      }
+      PageBuffer.size = 0;
+    } else {
+      if (PageBuffer.size >= PageBuffer.capacity) {
+        ssize_t new_capacity = PageBuffer.capacity * 2;
+        void *temp = realloc(PageBuffer.bufferedPages,
+                             new_capacity * sizeof(BufferedPage));
+
+        if (temp == NULL) {
+          printf("Error realocating buffered pages");
+          exit(EXIT_FAILURE);
+        }
+
+        PageBuffer.bufferedPages = temp;
+        PageBuffer.capacity = new_capacity;
+      }
+      PageBuffer.bufferedPages[PageBuffer.size].page_num = entry.page_num;
+      memcpy(PageBuffer.bufferedPages[PageBuffer.size].image, payload,
+             PAGE_SIZE);
+      PageBuffer.size++;
+    }
 
     wal_offset += WAL_COMMON_HEADER_SIZE + entry.length;
   }
+  pager->file_length = lseek(pager->fd, 0, SEEK_END);
+  pager->num_pages = pager->file_length / PAGE_SIZE;
 
-  free(header);
-  free(payload);
+  fsync(pager->fd);
+  free(PageBuffer.bufferedPages);
 }
 
 /* Frees WAL resources. */
@@ -1305,6 +1347,7 @@ void collapse_root(Table *table) {
   memcpy(root, child, PAGE_SIZE);
   *node_is_root_value(root) = 1;
   *node_parent(root) = 0;
+  pager_mark_dirty(table->pager, table->root_page_num);
 
   /* If the promoted child was internal, fix its children's parent ptrs. */
   if (*node_type_value(root) == NODE_TYPE_INTERNAL) {
@@ -1313,9 +1356,11 @@ void collapse_root(Table *table) {
       void *grandchild =
           get_page(table->pager, *internal_node_pointer(root, i));
       *node_parent(grandchild) = table->root_page_num;
+      pager_mark_dirty(table->pager, *internal_node_pointer(root, i));
     }
     void *last = get_page(table->pager, *internal_node_rightmost_pointer(root));
     *node_parent(last) = table->root_page_num;
+    pager_mark_dirty(table->pager, *internal_node_rightmost_pointer(root));
   }
 }
 
@@ -1368,6 +1413,10 @@ void leaf_node_redistribute(Pager *pager, uint32_t node_page_num,
 
   *internal_node_key(parent, separator_index) =
       leaf_node_key_at_slot(left_child, left_num_cells - 1);
+
+  pager_mark_dirty(pager, node_page_num);
+  pager_mark_dirty(pager, sibling_page_num);
+  pager_mark_dirty(pager, *node_parent(node));
 }
 
 /* Merge the RIGHT leaf into the LEFT leaf */
@@ -1403,10 +1452,16 @@ void leaf_node_merge(Pager *pager, uint32_t left_page_num,
   leaf_node_rebuild(left_node, all_keys, all_records, left_n + right_n,
                     next_ptr);
 
-  void *parent = get_page(pager, *node_parent(left_node));
+  uint32_t parent_page_num = *node_parent(left_node);
+  void *parent = get_page(pager, parent_page_num);
   internal_node_remove_key(parent, separator_index);
 
-  /* Evict the now-orphaned right page from the pager cache. */
+  pager_mark_dirty(pager, left_page_num);
+  pager_mark_dirty(pager, parent_page_num);
+
+  /* Evict the now-orphaned right page from the pager cache. Clear its dirty
+     flag first so flush_to_wal won't log a freed page. */
+  pager->dirty[right_page_num] = 0;
   pager->pages[right_page_num] = NULL;
   free(right_node);
 }
@@ -1450,6 +1505,7 @@ void internal_node_redistribute(Pager *pager, uint32_t node_page_num,
         *internal_node_pointer(sibling, sibling_num_keys - 1);
 
     *node_parent(get_page(pager, moved_child)) = node_page_num;
+    pager_mark_dirty(pager, moved_child);
   } else {
     uint32_t moved_child = internal_node_child(sibling, 0);
     uint32_t old_rightmost_child = *internal_node_rightmost_pointer(node);
@@ -1473,10 +1529,15 @@ void internal_node_redistribute(Pager *pager, uint32_t node_page_num,
             (sibling_num_keys - 1) * INTERNAL_NODE_PAIR_SIZE);
 
     *node_parent(get_page(pager, moved_child)) = node_page_num;
+    pager_mark_dirty(pager, moved_child);
   }
 
   *internal_node_num_keys(node) = node_num_keys + 1;
   *internal_node_num_keys(sibling) = sibling_num_keys - 1;
+
+  pager_mark_dirty(pager, node_page_num);
+  pager_mark_dirty(pager, sibling_page_num);
+  pager_mark_dirty(pager, parent_page_num);
 }
 
 /* Implement merge for internal-node underflow. */
@@ -1508,12 +1569,14 @@ void internal_node_merge(Pager *pager, uint32_t left_page_num,
 
     void *node_to_append = get_page(pager, node_num_to_append);
     *node_parent(node_to_append) = left_page_num;
+    pager_mark_dirty(pager, node_num_to_append);
   }
 
   /* Transfer right's rightmost child to left, update its parent pointer. */
   uint32_t right_rightmost = *internal_node_rightmost_pointer(right_node);
   *internal_node_rightmost_pointer(left_node) = right_rightmost;
   *node_parent(get_page(pager, right_rightmost)) = left_page_num;
+  pager_mark_dirty(pager, right_rightmost);
 
   /* Update left's key count: bridge key + all of right's keys. */
   *internal_node_num_keys(left_node) =
@@ -1521,7 +1584,12 @@ void internal_node_merge(Pager *pager, uint32_t left_page_num,
 
   internal_node_remove_key(parent, separator_index);
 
-  /* Evict the right page from the pager cache without a double-free. */
+  pager_mark_dirty(pager, left_page_num);
+  pager_mark_dirty(pager, parent_node_num);
+
+  /* Evict the right page from the pager cache without a double-free. Clear its
+     dirty flag first so flush_to_wal won't log a freed page. */
+  pager->dirty[right_page_num] = 0;
   pager->pages[right_page_num] = NULL;
   free(right_node);
 }
@@ -1651,11 +1719,15 @@ void execute_delete(Statement *statement, Table *table) {
   *leaf_node_num_cells(node) -= 1;
   *leaf_node_free_start(node) -= LEAF_NODE_SLOT_SIZE;
 
+  pager_mark_dirty(table->pager, deleted_page);
+
   /* Check for underflow: non-root leaf dropped below minimum occupancy. */
   if (!*node_is_root_value(node) &&
       *leaf_node_num_cells(node) < LEAF_NODE_MIN_CELLS) {
     handle_underflow(table->pager, table, deleted_page);
   }
+
+  flush_to_wal(table->pager);
 
   free(cursor);
 }
