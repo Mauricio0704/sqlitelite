@@ -367,6 +367,7 @@ void wal_commit(WAL *wal, uint32_t txid) {
 void wal_clean(WAL *wal) {
   ftruncate(wal->fd, 0);
   lseek(wal->fd, 0, SEEK_SET);
+  wal->file_length = 0;
 }
 
 void wal_recover(Pager *pager) {
@@ -464,6 +465,7 @@ void wal_recover(Pager *pager) {
 
   fsync(pager->fd);
   free(PageBuffer.bufferedPages);
+  wal_clean(pager->wal);
 }
 
 /* Frees WAL resources. */
@@ -534,6 +536,7 @@ void close_db(Table *table) {
     free(pager->pages[i]);
     pager->pages[i] = NULL;
   }
+  fsync(pager->fd);
 
   for (uint32_t i = 0; i < TABLE_MAX_PAGES; i++) {
     void *page = pager->pages[i];
@@ -543,6 +546,8 @@ void close_db(Table *table) {
     }
   }
 
+  wal_clean(pager->wal);
+  wal_close(pager->wal);
   close(pager->fd);
   free(pager);
   free(table);
