@@ -627,6 +627,11 @@ class TestWALRecovery(DBTestCase):
     def _inserts(lo: int, hi: int) -> list[str]:
         return [f"insert {i} user{i} u{i}@x.com" for i in range(lo, hi)]
 
+    def clean_exit(self, commands: list[str]) -> None:
+        """Run commands followed by a clean `.exit`, so close_db flushes every
+        page to the .db file, fsyncs, and checkpoints (truncates) the WAL."""
+        run_db(commands + [".exit"], self.db)
+
     # -- tests -------------------------------------------------------------
 
     def test_committed_inserts_survive_crash(self):
@@ -683,6 +688,27 @@ class TestWALRecovery(DBTestCase):
         with open(self.wal_path(), "r+b") as f:
             f.truncate(size - 10)
         self.assertEqual(self.reopen_ids(), [1])
+
+    # -- checkpointing (M3) ------------------------------------------------
+
+    def test_checkpoint_truncates_wal_on_clean_exit(self):
+        # 14 rows force a split, so the WAL accumulates a multi-page commit.
+        self.clean_exit(self._inserts(1, 15))
+        # On clean exit close_db flushed every page to .db and fsync'd, then
+        # checkpointed: the WAL must be truncated to empty (nothing to redo),
+        # while the data now lives in the .db file.
+        self.assertEqual(os.path.getsize(self.wal_path()), 0)
+        self.assertGreater(os.path.getsize(self.db), 0)
+        self.assertEqual(self.reopen_ids(), list(range(1, 15)))
+
+    def test_clean_exit_makes_db_authoritative_over_stale_wal(self):
+        self.clean_exit(self._inserts(1, 15))
+        # The checkpoint emptied the WAL. Pour garbage into it: recovery must
+        # not depend on the log, because the checkpoint already made .db the
+        # authoritative copy. Data survives intact.
+        with open(self.wal_path(), "ab") as f:
+            f.write(b"\xff" * 200)
+        self.assertEqual(self.reopen_ids(), list(range(1, 15)))
 
 
 if __name__ == "__main__":
