@@ -1,3 +1,4 @@
+#include <ctype.h>
 #include <fcntl.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -64,6 +65,21 @@ typedef struct {
   Record record_to_insert;
   uint32_t id_to_delete;
 } Statement;
+
+typedef enum {
+  TOKEN_KW_SELECT,
+  TOKEN_KW_INSERT,
+  TOKEN_KW_DELETE,
+  TOKEN_INT_LITERAL,
+  TOKEN_STR_LITERAL,
+  TOKEN_EOF
+} TokenType;
+
+typedef struct {
+  TokenType type;
+  char *start_lexeme;
+  size_t len_lexeme;
+} Token;
 
 typedef enum { COMMIT, CHECKPOINT, PAGE_CHANGE } WALEntryType;
 
@@ -723,45 +739,6 @@ MetaCommandStatus execute_meta_command(InputBuffer *input_buffer,
   }
 
   return META_COMMAND_UNRECOGNIZED_COMMAND;
-}
-
-/* Parses user input into an executable SQL-like statement structure. */
-PrepareStatus prepare_statement(InputBuffer *input_buffer,
-                                Statement *statement) {
-  if (strncmp(input_buffer->buffer, "insert", 6) == 0) {
-    statement->statement_type = STATEMENT_INSERT;
-
-    int args_assigned = sscanf(input_buffer->buffer, "insert %d %31s %254s",
-                               &(statement->record_to_insert.id),
-                               statement->record_to_insert.username,
-                               statement->record_to_insert.email);
-
-    if (args_assigned < 3) {
-      printf("Incorrect arguments for insert\n");
-      return PREPARE_FAILURE;
-    }
-
-    return PREPARE_SUCCESS;
-  }
-  if (strcmp(input_buffer->buffer, "select") == 0) {
-    statement->statement_type = STATEMENT_SELECT;
-    return PREPARE_SUCCESS;
-  }
-  if (strncmp(input_buffer->buffer, "delete", 6) == 0) {
-    statement->statement_type = STATEMENT_DELETE;
-
-    int args_assigned =
-        sscanf(input_buffer->buffer, "delete %d", &(statement->id_to_delete));
-
-    if (args_assigned < 1) {
-      printf("Incorrect arguments for delete\n");
-      return PREPARE_FAILURE;
-    }
-
-    return PREPARE_SUCCESS;
-  }
-
-  return PREPARE_UNRECOGNIZED_COMMAND;
 }
 
 /* Reads one line of user input into the input buffer. */
@@ -1750,6 +1727,111 @@ ExecuteStatus execute_statement(Statement *statement, Table *table) {
   }
 
   return EXECUTE_SUCCESS;
+}
+
+/* Parses an EOF-terminated token stream into a Statement. The grammar is a
+ * fixed sequence per keyword, so each branch just type-checks its tokens.
+ * Reads stop at the first mismatch (the array is always EOF-terminated, so
+ * the short-circuit never reads past EOF). */
+PrepareStatus parse_statement(Token *tokens, Statement *statement) {
+  switch (tokens[0].type) {
+  case TOKEN_KW_SELECT:
+    if (tokens[1].type != TOKEN_EOF)
+      return PREPARE_FAILURE;
+    statement->statement_type = STATEMENT_SELECT;
+    return PREPARE_SUCCESS;
+
+  case TOKEN_KW_INSERT: {
+    if (tokens[1].type != TOKEN_INT_LITERAL ||
+        tokens[2].type != TOKEN_STR_LITERAL ||
+        tokens[3].type != TOKEN_STR_LITERAL || tokens[4].type != TOKEN_EOF) {
+      printf("Incorrect arguments for insert\n");
+      return PREPARE_FAILURE;
+    }
+
+    Record *record = &statement->record_to_insert;
+    /* Need room for a trailing '\0', so len must be strictly less than the
+     * field capacity. */
+    if (tokens[2].len_lexeme >= sizeof(record->username) ||
+        tokens[3].len_lexeme >= sizeof(record->email)) {
+      printf("Incorrect arguments for insert\n");
+      return PREPARE_FAILURE;
+    }
+
+    statement->statement_type = STATEMENT_INSERT;
+    record->id = (uint32_t)strtol(tokens[1].start_lexeme, NULL, 10);
+    memcpy(record->username, tokens[2].start_lexeme, tokens[2].len_lexeme);
+    record->username[tokens[2].len_lexeme] = '\0';
+    memcpy(record->email, tokens[3].start_lexeme, tokens[3].len_lexeme);
+    record->email[tokens[3].len_lexeme] = '\0';
+    return PREPARE_SUCCESS;
+  }
+
+  case TOKEN_KW_DELETE:
+    if (tokens[1].type != TOKEN_INT_LITERAL || tokens[2].type != TOKEN_EOF) {
+      printf("Incorrect arguments for delete\n");
+      return PREPARE_FAILURE;
+    }
+    statement->statement_type = STATEMENT_DELETE;
+    statement->id_to_delete =
+        (uint32_t)strtol(tokens[1].start_lexeme, NULL, 10);
+    return PREPARE_SUCCESS;
+
+  default:
+    return PREPARE_UNRECOGNIZED_COMMAND;
+  }
+}
+
+// Classifies a word into a token:
+Token classify_word(const char *start, size_t len) {
+  if (len == 6 && strncmp(start, "select", 6) == 0)
+    return (Token){TOKEN_KW_SELECT, (char *)start, len};
+  if (len == 6 && strncmp(start, "insert", 6) == 0)
+    return (Token){TOKEN_KW_INSERT, (char *)start, len};
+  if (len == 6 && strncmp(start, "delete", 6) == 0)
+    return (Token){TOKEN_KW_DELETE, (char *)start, len};
+
+  for (size_t i = 0; i < len; i++) {
+    if (!isdigit((unsigned char)start[i]))
+      return (Token){TOKEN_STR_LITERAL, (char *)start, len};
+  }
+  return (Token){TOKEN_INT_LITERAL, (char *)start, len};
+}
+
+// Tokenizes one input line.
+Token *lexer(const char *line) {
+  size_t line_len = strlen(line);
+
+  /* Upper bound: at most one token per char, plus the EOF terminator. */
+  Token *tokens = malloc(sizeof(Token) * (line_len + 1));
+  if (tokens == NULL) {
+    printf("Unable to allocate tokens\n");
+    exit(EXIT_FAILURE);
+  }
+
+  size_t curr_token = 0;
+  size_t start = 0;
+  for (size_t i = 0; i <= line_len; i++) {
+    /* A token ends at any whitespace or at the terminating '\0' (i == len). */
+    if (i == line_len || isspace((unsigned char)line[i])) {
+      if (i > start)
+        tokens[curr_token++] = classify_word(line + start, i - start);
+      start = i + 1;
+    }
+  }
+
+  tokens[curr_token] = (Token){TOKEN_EOF, NULL, 0};
+  return tokens;
+}
+
+/* Parses user input into an executable SQL-like statement structure. */
+PrepareStatus prepare_statement(InputBuffer *input_buffer,
+                                Statement *statement) {
+  Token *tokens = lexer(input_buffer->buffer);
+  PrepareStatus status = parse_statement(tokens, statement);
+
+  free(tokens);
+  return status;
 }
 
 /* Program entry point: opens DB, runs REPL loop, and executes statements. */
