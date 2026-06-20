@@ -171,6 +171,62 @@ class TestSelectBasic(DBTestCase):
 
 
 # ---------------------------------------------------------------------------
+# 3b. Column projection
+# ---------------------------------------------------------------------------
+
+
+class TestProjection(DBTestCase):
+
+    def _one_row(self):
+        return ["insert 1 alice alice@example.com"]
+
+    def test_bare_select_returns_all_columns(self):
+        lines = self.run_cmds(self._one_row() + ["select", ".exit"])
+        self.assertIn("(1, alice, alice@example.com)", lines)
+
+    def test_project_single_column(self):
+        lines = self.run_cmds(self._one_row() + ["select id", ".exit"])
+        self.assertIn("(1)", lines)
+
+    def test_project_name_column(self):
+        lines = self.run_cmds(self._one_row() + ["select name", ".exit"])
+        self.assertIn("(alice)", lines)
+
+    def test_project_multiple_columns_in_order(self):
+        lines = self.run_cmds(self._one_row() + ["select id, email", ".exit"])
+        self.assertIn("(1, alice@example.com)", lines)
+
+    def test_projection_preserves_requested_order(self):
+        # Reversed order must come out reversed, not in schema order.
+        lines = self.run_cmds(self._one_row() + ["select email, id", ".exit"])
+        self.assertIn("(alice@example.com, 1)", lines)
+
+    def test_projection_without_spaces_around_comma(self):
+        lines = self.run_cmds(self._one_row() + ["select id,email", ".exit"])
+        self.assertIn("(1, alice@example.com)", lines)
+
+    def test_repeated_column_allowed(self):
+        lines = self.run_cmds(self._one_row() + ["select id, id", ".exit"])
+        self.assertIn("(1, 1)", lines)
+
+    def test_unknown_column_rejected(self):
+        # 'bogus' resolves to no column, so the select fails and emits no row.
+        lines = self.run_cmds(self._one_row() + ["select bogus", ".exit"])
+        rows = [l for l in lines if l.startswith("(")]
+        self.assertEqual(rows, [])
+
+    def test_value_named_like_a_column_inserts(self):
+        # Regression: column names must not be reserved words. Before generic
+        # identifiers, 'id'/'name'/'email' as values broke the insert.
+        lines = self.run_cmds([
+            "insert 1 id id@example.com",
+            "select",
+            ".exit",
+        ])
+        self.assertIn("(1, id, id@example.com)", lines)
+
+
+# ---------------------------------------------------------------------------
 # 4. Persistence
 # ---------------------------------------------------------------------------
 

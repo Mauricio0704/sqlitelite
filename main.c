@@ -55,25 +55,36 @@ typedef enum {
 } NodeType;
 
 typedef enum {
+  TOKEN_KW_SELECT,
+  TOKEN_KW_INSERT,
+  TOKEN_KW_DELETE,
+  TOKEN_KW_WHERE,
+  TOKEN_OP_EQUAL,
+  TOKEN_COMMA,
+  TOKEN_IDENTIFIER,
+  TOKEN_INT_LITERAL,
+  TOKEN_EOF
+} TokenType;
+
+typedef enum {
   STATEMENT_INSERT,
   STATEMENT_SELECT,
   STATEMENT_DELETE
 } StatementType;
 
+typedef enum { COLUMN_ID, COLUMN_USERNAME, COLUMN_EMAIL } ColumnId;
+
+/* Upper bound on columns in a SELECT projection list (allows repeats). */
+#define MAX_SELECT_COLUMNS 8
+
 typedef struct {
   StatementType statement_type;
   Record record_to_insert;
   uint32_t id_to_delete;
+  /* Ordered projection list. A count of 0 means "all columns" (bare SELECT). */
+  ColumnId projection[MAX_SELECT_COLUMNS];
+  size_t projection_count;
 } Statement;
-
-typedef enum {
-  TOKEN_KW_SELECT,
-  TOKEN_KW_INSERT,
-  TOKEN_KW_DELETE,
-  TOKEN_INT_LITERAL,
-  TOKEN_STR_LITERAL,
-  TOKEN_EOF
-} TokenType;
 
 typedef struct {
   TokenType type;
@@ -1117,11 +1128,35 @@ void leaf_node_insert(Cursor *cursor, uint32_t key, Record *record) {
   pager_mark_dirty(cursor->table->pager, cursor->page_num);
 }
 
-/* Reads and prints the record currently addressed by the cursor. */
-void access_row(Cursor *cursor) {
+/* Reads and prints the record currently addressed by the cursor, emitting only
+ * the projected columns in order. A count of 0 prints every column. */
+void access_row(Cursor *cursor, const ColumnId *projection,
+                size_t projection_count) {
   Record record;
   read_deserialized_record(get_record_start(cursor), &record);
-  printf("(%d, %s, %s)\n", record.id, record.username, record.email);
+
+  if (projection_count == 0) {
+    printf("(%d, %s, %s)\n", record.id, record.username, record.email);
+    return;
+  }
+
+  printf("(");
+  for (size_t i = 0; i < projection_count; i++) {
+    if (i > 0)
+      printf(", ");
+    switch (projection[i]) {
+    case COLUMN_ID:
+      printf("%d", record.id);
+      break;
+    case COLUMN_USERNAME:
+      printf("%s", record.username);
+      break;
+    case COLUMN_EMAIL:
+      printf("%s", record.email);
+      break;
+    }
+  }
+  printf(")\n");
 }
 
 /* Traverses the B+ tree to locate a key. Returns a Cursor pointing to the
@@ -1210,7 +1245,7 @@ void execute_select(Statement *statement, Table *table) {
   }
 
   while (!(cursor->is_end_of_table)) {
-    access_row(cursor);
+    access_row(cursor, statement->projection, statement->projection_count);
     advance_cursor(cursor);
   }
 
@@ -1733,18 +1768,60 @@ ExecuteStatus execute_statement(Statement *statement, Table *table) {
  * fixed sequence per keyword, so each branch just type-checks its tokens.
  * Reads stop at the first mismatch (the array is always EOF-terminated, so
  * the short-circuit never reads past EOF). */
+/* Maps a column-name identifier to its ColumnId. Returns 1 on success. */
+int resolve_column(Token token, ColumnId *out) {
+  if (token.len_lexeme == 2 && strncmp(token.start_lexeme, "id", 2) == 0)
+    *out = COLUMN_ID;
+  else if (token.len_lexeme == 4 && strncmp(token.start_lexeme, "name", 4) == 0)
+    *out = COLUMN_USERNAME;
+  else if (token.len_lexeme == 5 && strncmp(token.start_lexeme, "email", 5) == 0)
+    *out = COLUMN_EMAIL;
+  else
+    return 0;
+  return 1;
+}
+
+/* A value (in an INSERT) is any bare word: an identifier or an integer. The
+ * unquoted grammar can't tell "alice" the name from a column name lexically, so
+ * the parser accepts either in value position. */
+int is_value_token(TokenType type) {
+  return type == TOKEN_IDENTIFIER || type == TOKEN_INT_LITERAL;
+}
+
 PrepareStatus parse_statement(Token *tokens, Statement *statement) {
   switch (tokens[0].type) {
-  case TOKEN_KW_SELECT:
-    if (tokens[1].type != TOKEN_EOF)
-      return PREPARE_FAILURE;
+  case TOKEN_KW_SELECT: {
     statement->statement_type = STATEMENT_SELECT;
-    return PREPARE_SUCCESS;
+    statement->projection_count = 0;
+
+    /* Bare SELECT projects every column. */
+    if (tokens[1].type == TOKEN_EOF)
+      return PREPARE_SUCCESS;
+
+    /* Otherwise parse a comma-separated list of column identifiers. */
+    size_t pos = 1;
+    while (1) {
+      if (tokens[pos].type != TOKEN_IDENTIFIER ||
+          statement->projection_count >= MAX_SELECT_COLUMNS)
+        return PREPARE_FAILURE;
+
+      ColumnId col;
+      if (!resolve_column(tokens[pos], &col))
+        return PREPARE_FAILURE;
+      statement->projection[statement->projection_count++] = col;
+      pos++;
+
+      if (tokens[pos].type == TOKEN_EOF)
+        return PREPARE_SUCCESS;
+      if (tokens[pos].type != TOKEN_COMMA)
+        return PREPARE_FAILURE;
+      pos++; /* consume comma; another column must follow */
+    }
+  }
 
   case TOKEN_KW_INSERT: {
-    if (tokens[1].type != TOKEN_INT_LITERAL ||
-        tokens[2].type != TOKEN_STR_LITERAL ||
-        tokens[3].type != TOKEN_STR_LITERAL || tokens[4].type != TOKEN_EOF) {
+    if (tokens[1].type != TOKEN_INT_LITERAL || !is_value_token(tokens[2].type) ||
+        !is_value_token(tokens[3].type) || tokens[4].type != TOKEN_EOF) {
       printf("Incorrect arguments for insert\n");
       return PREPARE_FAILURE;
     }
@@ -1790,10 +1867,12 @@ Token classify_word(const char *start, size_t len) {
     return (Token){TOKEN_KW_INSERT, (char *)start, len};
   if (len == 6 && strncmp(start, "delete", 6) == 0)
     return (Token){TOKEN_KW_DELETE, (char *)start, len};
+  if (len == 5 && strncmp(start, "where", 5) == 0)
+    return (Token){TOKEN_KW_WHERE, (char *)start, len};
 
   for (size_t i = 0; i < len; i++) {
     if (!isdigit((unsigned char)start[i]))
-      return (Token){TOKEN_STR_LITERAL, (char *)start, len};
+      return (Token){TOKEN_IDENTIFIER, (char *)start, len};
   }
   return (Token){TOKEN_INT_LITERAL, (char *)start, len};
 }
@@ -1812,10 +1891,19 @@ Token *lexer(const char *line) {
   size_t curr_token = 0;
   size_t start = 0;
   for (size_t i = 0; i <= line_len; i++) {
-    /* A token ends at any whitespace or at the terminating '\0' (i == len). */
-    if (i == line_len || isspace((unsigned char)line[i])) {
+    char c = line[i]; /* line[line_len] is the terminating '\0' */
+    int at_end = (i == line_len);
+    int is_punct = (c == ',' || c == '=');
+
+    /* A word token ends at whitespace, at single-char punctuation, or at the
+     * terminating '\0'. Punctuation is then emitted as its own token. */
+    if (at_end || isspace((unsigned char)c) || is_punct) {
       if (i > start)
         tokens[curr_token++] = classify_word(line + start, i - start);
+      if (is_punct) {
+        TokenType type = (c == ',') ? TOKEN_COMMA : TOKEN_OP_EQUAL;
+        tokens[curr_token++] = (Token){type, (char *)(line + i), 1};
+      }
       start = i + 1;
     }
   }
