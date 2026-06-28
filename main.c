@@ -78,12 +78,20 @@ typedef enum { COLUMN_ID, COLUMN_USERNAME, COLUMN_EMAIL } ColumnId;
 #define MAX_SELECT_COLUMNS 8
 
 typedef struct {
+  ColumnId col;
+  TokenType operator;
+  uint32_t val;
+} Expr;
+
+typedef struct {
   StatementType statement_type;
   Record record_to_insert;
   uint32_t id_to_delete;
   /* Ordered projection list. A count of 0 means "all columns" (bare SELECT). */
   ColumnId projection[MAX_SELECT_COLUMNS];
   size_t projection_count;
+  int has_where;
+  Expr where_expr;
 } Statement;
 
 typedef struct {
@@ -1130,11 +1138,8 @@ void leaf_node_insert(Cursor *cursor, uint32_t key, Record *record) {
 
 /* Reads and prints the record currently addressed by the cursor, emitting only
  * the projected columns in order. A count of 0 prints every column. */
-void access_row(Cursor *cursor, const ColumnId *projection,
+void print_row(Record record, const ColumnId *projection,
                 size_t projection_count) {
-  Record record;
-  read_deserialized_record(get_record_start(cursor), &record);
-
   if (projection_count == 0) {
     printf("(%d, %s, %s)\n", record.id, record.username, record.email);
     return;
@@ -1232,6 +1237,23 @@ ExecuteStatus execute_insert(Statement *statement, Table *table) {
   return EXECUTE_SUCCESS;
 }
 
+uint8_t row_matches(Expr where_expr, Record record) {
+  switch (where_expr.col) {
+  case COLUMN_ID:
+    if (record.id != where_expr.val) {
+      return 0;
+    }
+    break;
+  case COLUMN_EMAIL:
+    return 0;
+    break;
+  case COLUMN_USERNAME:
+    return 0;
+    break;
+  }
+  return 1;
+}
+
 /* Print all records in the table in ascending key order. */
 void execute_select(Statement *statement, Table *table) {
   Cursor *cursor = new_cursor_start(table);
@@ -1245,7 +1267,10 @@ void execute_select(Statement *statement, Table *table) {
   }
 
   while (!(cursor->is_end_of_table)) {
-    access_row(cursor, statement->projection, statement->projection_count);
+    Record record;
+    read_deserialized_record(get_record_start(cursor), &record);
+    if (!statement->has_where || row_matches(statement->where_expr, record))
+      print_row(record, statement->projection, statement->projection_count);
     advance_cursor(cursor);
   }
 
@@ -1774,7 +1799,8 @@ int resolve_column(Token token, ColumnId *out) {
     *out = COLUMN_ID;
   else if (token.len_lexeme == 4 && strncmp(token.start_lexeme, "name", 4) == 0)
     *out = COLUMN_USERNAME;
-  else if (token.len_lexeme == 5 && strncmp(token.start_lexeme, "email", 5) == 0)
+  else if (token.len_lexeme == 5 &&
+           strncmp(token.start_lexeme, "email", 5) == 0)
     *out = COLUMN_EMAIL;
   else
     return 0;
@@ -1793,6 +1819,7 @@ PrepareStatus parse_statement(Token *tokens, Statement *statement) {
   case TOKEN_KW_SELECT: {
     statement->statement_type = STATEMENT_SELECT;
     statement->projection_count = 0;
+    statement->has_where = 0;
 
     /* Bare SELECT projects every column. */
     if (tokens[1].type == TOKEN_EOF)
@@ -1813,6 +1840,24 @@ PrepareStatus parse_statement(Token *tokens, Statement *statement) {
 
       if (tokens[pos].type == TOKEN_EOF)
         return PREPARE_SUCCESS;
+      if (tokens[pos].type == TOKEN_KW_WHERE) {
+        ColumnId where_col;
+        if (!resolve_column(tokens[++pos], &where_col))
+          return PREPARE_FAILURE;
+        Expr where_expr;
+        where_expr.col = where_col;
+        if (tokens[++pos].type != TOKEN_OP_EQUAL)
+          return PREPARE_FAILURE;
+        where_expr.operator = TOKEN_OP_EQUAL;
+        if (tokens[++pos].type != TOKEN_INT_LITERAL)
+          return PREPARE_FAILURE;
+        where_expr.val = (uint32_t)strtol(tokens[pos].start_lexeme, NULL, 10);
+        statement->has_where = 1;
+        statement->where_expr = where_expr;
+        if (tokens[++pos].type == TOKEN_EOF)
+          return PREPARE_SUCCESS;
+        return PREPARE_FAILURE;
+      }
       if (tokens[pos].type != TOKEN_COMMA)
         return PREPARE_FAILURE;
       pos++; /* consume comma; another column must follow */
@@ -1820,8 +1865,9 @@ PrepareStatus parse_statement(Token *tokens, Statement *statement) {
   }
 
   case TOKEN_KW_INSERT: {
-    if (tokens[1].type != TOKEN_INT_LITERAL || !is_value_token(tokens[2].type) ||
-        !is_value_token(tokens[3].type) || tokens[4].type != TOKEN_EOF) {
+    if (tokens[1].type != TOKEN_INT_LITERAL ||
+        !is_value_token(tokens[2].type) || !is_value_token(tokens[3].type) ||
+        tokens[4].type != TOKEN_EOF) {
       printf("Incorrect arguments for insert\n");
       return PREPARE_FAILURE;
     }
