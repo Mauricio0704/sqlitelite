@@ -59,6 +59,7 @@ typedef enum {
   TOKEN_KW_INSERT,
   TOKEN_KW_DELETE,
   TOKEN_KW_WHERE,
+  TOKEN_OP_ALL,
   TOKEN_OP_EQUAL,
   TOKEN_COMMA,
   TOKEN_IDENTIFIER,
@@ -80,7 +81,8 @@ typedef enum { COLUMN_ID, COLUMN_USERNAME, COLUMN_EMAIL } ColumnId;
 typedef struct {
   ColumnId col;
   TokenType operator;
-  uint32_t val;
+  uint32_t intval;
+  char *strval;
 } Expr;
 
 typedef struct {
@@ -1139,7 +1141,7 @@ void leaf_node_insert(Cursor *cursor, uint32_t key, Record *record) {
 /* Reads and prints the record currently addressed by the cursor, emitting only
  * the projected columns in order. A count of 0 prints every column. */
 void print_row(Record record, const ColumnId *projection,
-                size_t projection_count) {
+               size_t projection_count) {
   if (projection_count == 0) {
     printf("(%d, %s, %s)\n", record.id, record.username, record.email);
     return;
@@ -1240,15 +1242,16 @@ ExecuteStatus execute_insert(Statement *statement, Table *table) {
 uint8_t row_matches(Expr where_expr, Record record) {
   switch (where_expr.col) {
   case COLUMN_ID:
-    if (record.id != where_expr.val) {
+    if (record.id != where_expr.intval)
       return 0;
-    }
     break;
   case COLUMN_EMAIL:
-    return 0;
+    if (strcmp(record.email, where_expr.strval) != 0)
+      return 0;
     break;
   case COLUMN_USERNAME:
-    return 0;
+    if (strcmp(record.username, where_expr.strval) != 0)
+      return 0;
     break;
   }
   return 1;
@@ -1274,6 +1277,9 @@ void execute_select(Statement *statement, Table *table) {
     advance_cursor(cursor);
   }
 
+  if (statement->has_where && (statement->where_expr.col == COLUMN_USERNAME ||
+                               statement->where_expr.col == COLUMN_EMAIL))
+    free(statement->where_expr.strval);
   free(cursor);
 }
 
@@ -1814,6 +1820,35 @@ int is_value_token(TokenType type) {
   return type == TOKEN_IDENTIFIER || type == TOKEN_INT_LITERAL;
 }
 
+PrepareStatus parse_where(Expr *where_expr, Token *tokens, uint32_t pos) {
+  ColumnId where_col;
+  if (!resolve_column(tokens[++pos], &where_col))
+    return PREPARE_FAILURE;
+  where_expr->col = where_col;
+  if (tokens[++pos].type != TOKEN_OP_EQUAL)
+    return PREPARE_FAILURE;
+  where_expr->operator = TOKEN_OP_EQUAL;
+  if (!is_value_token(tokens[++pos].type))
+    return PREPARE_FAILURE;
+  if (tokens[pos].type == TOKEN_INT_LITERAL) {
+    /* Only the integer column may be compared against an int literal. */
+    if (where_col != COLUMN_ID)
+      return PREPARE_FAILURE;
+    where_expr->intval = (uint32_t)strtol(tokens[pos].start_lexeme, NULL, 10);
+  } else {
+    /* String literals only match the string columns. */
+    if (where_col == COLUMN_ID)
+      return PREPARE_FAILURE;
+    where_expr->strval = malloc(sizeof(char) * (tokens[pos].len_lexeme + 1));
+    memcpy(where_expr->strval, tokens[pos].start_lexeme,
+           tokens[pos].len_lexeme);
+    where_expr->strval[tokens[pos].len_lexeme] = '\0';
+  }
+  if (tokens[++pos].type == TOKEN_EOF)
+    return PREPARE_SUCCESS;
+  return PREPARE_FAILURE;
+}
+
 PrepareStatus parse_statement(Token *tokens, Statement *statement) {
   switch (tokens[0].type) {
   case TOKEN_KW_SELECT: {
@@ -1824,12 +1859,23 @@ PrepareStatus parse_statement(Token *tokens, Statement *statement) {
     /* Bare SELECT projects every column. */
     if (tokens[1].type == TOKEN_EOF)
       return PREPARE_SUCCESS;
+    if (tokens[1].type == TOKEN_OP_ALL) {
+      if (tokens[2].type == TOKEN_KW_WHERE) {
+        Expr where_expr;
+        if (parse_where(&where_expr, tokens, 2) == PREPARE_FAILURE)
+          return PREPARE_FAILURE;
+        statement->has_where = 1;
+        statement->where_expr = where_expr;
+        return PREPARE_SUCCESS;
+      } else if (tokens[2].type == TOKEN_EOF)
+        return PREPARE_SUCCESS;
+    }
 
     /* Otherwise parse a comma-separated list of column identifiers. */
     size_t pos = 1;
     while (1) {
       if (tokens[pos].type != TOKEN_IDENTIFIER ||
-          statement->projection_count >= MAX_SELECT_COLUMNS)
+           statement->projection_count >= MAX_SELECT_COLUMNS)
         return PREPARE_FAILURE;
 
       ColumnId col;
@@ -1841,22 +1887,12 @@ PrepareStatus parse_statement(Token *tokens, Statement *statement) {
       if (tokens[pos].type == TOKEN_EOF)
         return PREPARE_SUCCESS;
       if (tokens[pos].type == TOKEN_KW_WHERE) {
-        ColumnId where_col;
-        if (!resolve_column(tokens[++pos], &where_col))
-          return PREPARE_FAILURE;
         Expr where_expr;
-        where_expr.col = where_col;
-        if (tokens[++pos].type != TOKEN_OP_EQUAL)
+        if (parse_where(&where_expr, tokens, pos) == PREPARE_FAILURE)
           return PREPARE_FAILURE;
-        where_expr.operator = TOKEN_OP_EQUAL;
-        if (tokens[++pos].type != TOKEN_INT_LITERAL)
-          return PREPARE_FAILURE;
-        where_expr.val = (uint32_t)strtol(tokens[pos].start_lexeme, NULL, 10);
         statement->has_where = 1;
         statement->where_expr = where_expr;
-        if (tokens[++pos].type == TOKEN_EOF)
-          return PREPARE_SUCCESS;
-        return PREPARE_FAILURE;
+        return PREPARE_SUCCESS;
       }
       if (tokens[pos].type != TOKEN_COMMA)
         return PREPARE_FAILURE;
@@ -1939,7 +1975,7 @@ Token *lexer(const char *line) {
   for (size_t i = 0; i <= line_len; i++) {
     char c = line[i]; /* line[line_len] is the terminating '\0' */
     int at_end = (i == line_len);
-    int is_punct = (c == ',' || c == '=');
+    int is_punct = (c == ',' || c == '=' || c == '*');
 
     /* A word token ends at whitespace, at single-char punctuation, or at the
      * terminating '\0'. Punctuation is then emitted as its own token. */
@@ -1947,7 +1983,18 @@ Token *lexer(const char *line) {
       if (i > start)
         tokens[curr_token++] = classify_word(line + start, i - start);
       if (is_punct) {
-        TokenType type = (c == ',') ? TOKEN_COMMA : TOKEN_OP_EQUAL;
+        TokenType type;
+        switch (c) {
+        case ',':
+          type = TOKEN_COMMA;
+          break;
+        case '=':
+          type = TOKEN_OP_EQUAL;
+          break;
+        case '*':
+          type = TOKEN_OP_ALL;
+          break;
+        }
         tokens[curr_token++] = (Token){type, (char *)(line + i), 1};
       }
       start = i + 1;
