@@ -226,6 +226,121 @@ class TestProjection(DBTestCase):
         self.assertIn("(1, id, id@example.com)", lines)
 
 
+class TestWhere(DBTestCase):
+    """WHERE-clause filtering.
+
+    The first block (single comparison, int/string, type-matching) exercises
+    behaviour that already exists. The AND/OR block is forward-looking: those
+    tests are expected to FAIL until the recursive expression tree is built,
+    and are meant as a progress ladder — each goes green as you implement it.
+    """
+
+    def _people(self):
+        return [
+            "insert 1 alice alice@example.com",
+            "insert 2 bob bob@example.com",
+            "insert 3 carol carol@example.com",
+        ]
+
+    @staticmethod
+    def _rows(lines):
+        return [l for l in lines if l.startswith("(")]
+
+    # --- single comparison: already working -------------------------------
+
+    def test_where_int_selects_matching_row(self):
+        lines = self.run_cmds(self._people() + ["select * where id = 2", ".exit"])
+        rows = self._rows(lines)
+        self.assertEqual(rows, ["(2, bob, bob@example.com)"])
+
+    def test_where_int_no_match_is_empty(self):
+        lines = self.run_cmds(self._people() + ["select * where id = 99", ".exit"])
+        self.assertEqual(self._rows(lines), [])
+
+    def test_where_matches_name_string(self):
+        lines = self.run_cmds(self._people() + ["select * where name = bob", ".exit"])
+        self.assertEqual(self._rows(lines), ["(2, bob, bob@example.com)"])
+
+    def test_where_matches_email_string(self):
+        lines = self.run_cmds(
+            self._people() + ["select * where email = carol@example.com", ".exit"]
+        )
+        self.assertEqual(self._rows(lines), ["(3, carol, carol@example.com)"])
+
+    def test_where_combines_with_projection(self):
+        lines = self.run_cmds(self._people() + ["select name where id = 3", ".exit"])
+        self.assertEqual(self._rows(lines), ["(carol)"])
+
+    def test_where_string_no_match_is_empty(self):
+        lines = self.run_cmds(self._people() + ["select * where name = zoe", ".exit"])
+        self.assertEqual(self._rows(lines), [])
+
+    def test_where_string_literal_on_int_column_rejected(self):
+        # id is an int column; comparing it to a string must be rejected,
+        # not silently return the wrong rows.
+        lines = self.run_cmds(self._people() + ["select * where id = bob", ".exit"])
+        self.assertEqual(self._rows(lines), [])
+
+    def test_where_int_literal_on_string_column_rejected(self):
+        lines = self.run_cmds(self._people() + ["select * where name = 5", ".exit"])
+        self.assertEqual(self._rows(lines), [])
+
+    # --- AND / OR: progress ladder (expected to fail until implemented) ----
+
+    def test_where_and_both_true(self):
+        lines = self.run_cmds(
+            self._people() + ["select * where id = 1 and name = alice", ".exit"]
+        )
+        self.assertEqual(self._rows(lines), ["(1, alice, alice@example.com)"])
+
+    def test_where_and_one_false_is_empty(self):
+        lines = self.run_cmds(
+            self._people() + ["select * where id = 1 and name = bob", ".exit"]
+        )
+        self.assertEqual(self._rows(lines), [])
+
+    def test_where_or_selects_either(self):
+        lines = self.run_cmds(
+            self._people() + ["select * where id = 1 or id = 3", ".exit"]
+        )
+        self.assertEqual(
+            self._rows(lines),
+            ["(1, alice, alice@example.com)", "(3, carol, carol@example.com)"],
+        )
+
+    def test_where_or_both_false_is_empty(self):
+        lines = self.run_cmds(
+            self._people() + ["select * where id = 8 or id = 9", ".exit"]
+        )
+        self.assertEqual(self._rows(lines), [])
+
+    def test_where_and_binds_tighter_than_or(self):
+        # Parsed as (id=1 AND name=alice) OR id=3, so row 3 must appear.
+        # Under wrong precedence -- id=1 AND (name=alice OR id=3) -- row 3
+        # would be excluded. This test discriminates the grouping.
+        lines = self.run_cmds(
+            self._people()
+            + ["select * where id = 1 and name = alice or id = 3", ".exit"]
+        )
+        self.assertEqual(
+            self._rows(lines),
+            ["(1, alice, alice@example.com)", "(3, carol, carol@example.com)"],
+        )
+
+    def test_where_chained_or(self):
+        lines = self.run_cmds(
+            self._people() + ["select * where id = 1 or id = 2 or id = 3", ".exit"]
+        )
+        self.assertEqual(
+            self._rows(lines),
+            [
+                "(1, alice, alice@example.com)",
+                "(2, bob, bob@example.com)",
+                "(3, carol, carol@example.com)",
+            ],
+        )
+
+
 # ---------------------------------------------------------------------------
 # 4. Persistence
 # ---------------------------------------------------------------------------
