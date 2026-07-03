@@ -59,6 +59,8 @@ typedef enum {
   TOKEN_KW_INSERT,
   TOKEN_KW_DELETE,
   TOKEN_KW_WHERE,
+  TOKEN_KW_AND,
+  TOKEN_KW_OR,
   TOKEN_OP_ALL,
   TOKEN_OP_EQUAL,
   TOKEN_COMMA,
@@ -78,11 +80,16 @@ typedef enum { COLUMN_ID, COLUMN_USERNAME, COLUMN_EMAIL } ColumnId;
 /* Upper bound on columns in a SELECT projection list (allows repeats). */
 #define MAX_SELECT_COLUMNS 8
 
-typedef struct {
+typedef enum { COMPARISON, AND_EXPR, OR_EXPR } ExprKind;
+
+typedef struct Expr {
   ColumnId col;
   TokenType operator;
   uint32_t intval;
   char *strval;
+  ExprKind kind;
+  struct Expr *left;  // Just for or/and
+  struct Expr *right; // Just for or/and
 } Expr;
 
 typedef struct {
@@ -93,7 +100,7 @@ typedef struct {
   ColumnId projection[MAX_SELECT_COLUMNS];
   size_t projection_count;
   int has_where;
-  Expr where_expr;
+  Expr *where_expr;
 } Statement;
 
 typedef struct {
@@ -1239,22 +1246,37 @@ ExecuteStatus execute_insert(Statement *statement, Table *table) {
   return EXECUTE_SUCCESS;
 }
 
-uint8_t row_matches(Expr where_expr, Record record) {
-  switch (where_expr.col) {
-  case COLUMN_ID:
-    if (record.id != where_expr.intval)
-      return 0;
-    break;
-  case COLUMN_EMAIL:
-    if (strcmp(record.email, where_expr.strval) != 0)
-      return 0;
-    break;
-  case COLUMN_USERNAME:
-    if (strcmp(record.username, where_expr.strval) != 0)
-      return 0;
-    break;
+uint8_t row_matches(Expr *where_expr, Record record) {
+  switch (where_expr->kind) {
+  case COMPARISON:
+    switch (where_expr->col) {
+    case COLUMN_ID:
+      return record.id == where_expr->intval;
+    case COLUMN_EMAIL:
+      return strcmp(record.email, where_expr->strval) == 0;
+    case COLUMN_USERNAME:
+      return strcmp(record.username, where_expr->strval) == 0;
+    }
+    return 0;
+  case AND_EXPR:
+    return row_matches(where_expr->left, record) &&
+           row_matches(where_expr->right, record);
+  case OR_EXPR:
+    return row_matches(where_expr->left, record) ||
+           row_matches(where_expr->right, record);
   }
-  return 1;
+  return 0;
+}
+
+// Recursively frees a WHERE expression tree
+void free_expr(Expr *expr) {
+  if (expr == NULL)
+    return;
+  free_expr(expr->left);
+  free_expr(expr->right);
+  if (expr->kind == COMPARISON)
+    free(expr->strval);
+  free(expr);
 }
 
 /* Print all records in the table in ascending key order. */
@@ -1277,9 +1299,8 @@ void execute_select(Statement *statement, Table *table) {
     advance_cursor(cursor);
   }
 
-  if (statement->has_where && (statement->where_expr.col == COLUMN_USERNAME ||
-                               statement->where_expr.col == COLUMN_EMAIL))
-    free(statement->where_expr.strval);
+  if (statement->has_where)
+    free_expr(statement->where_expr);
   free(cursor);
 }
 
@@ -1795,10 +1816,6 @@ ExecuteStatus execute_statement(Statement *statement, Table *table) {
   return EXECUTE_SUCCESS;
 }
 
-/* Parses an EOF-terminated token stream into a Statement. The grammar is a
- * fixed sequence per keyword, so each branch just type-checks its tokens.
- * Reads stop at the first mismatch (the array is always EOF-terminated, so
- * the short-circuit never reads past EOF). */
 /* Maps a column-name identifier to its ColumnId. Returns 1 on success. */
 int resolve_column(Token token, ColumnId *out) {
   if (token.len_lexeme == 2 && strncmp(token.start_lexeme, "id", 2) == 0)
@@ -1820,34 +1837,74 @@ int is_value_token(TokenType type) {
   return type == TOKEN_IDENTIFIER || type == TOKEN_INT_LITERAL;
 }
 
-PrepareStatus parse_where(Expr *where_expr, Token *tokens, uint32_t pos) {
+Expr *parse_comparison(Token *tokens, uint32_t *pos) {
   ColumnId where_col;
-  if (!resolve_column(tokens[++pos], &where_col))
-    return PREPARE_FAILURE;
-  where_expr->col = where_col;
-  if (tokens[++pos].type != TOKEN_OP_EQUAL)
-    return PREPARE_FAILURE;
-  where_expr->operator = TOKEN_OP_EQUAL;
-  if (!is_value_token(tokens[++pos].type))
-    return PREPARE_FAILURE;
-  if (tokens[pos].type == TOKEN_INT_LITERAL) {
+  if (!resolve_column(tokens[*pos], &where_col))
+    return NULL;
+  (*pos)++;
+
+  if (tokens[*pos].type != TOKEN_OP_EQUAL)
+    return NULL;
+  (*pos)++;
+
+  if (!is_value_token(tokens[*pos].type))
+    return NULL;
+
+  Expr *expr = malloc(sizeof(Expr));
+  expr->kind = COMPARISON;
+  expr->left = NULL;
+  expr->right = NULL;
+  expr->strval = NULL;
+  expr->col = where_col;
+  expr->operator = TOKEN_OP_EQUAL;
+
+  if (tokens[*pos].type == TOKEN_INT_LITERAL) {
     /* Only the integer column may be compared against an int literal. */
-    if (where_col != COLUMN_ID)
-      return PREPARE_FAILURE;
-    where_expr->intval = (uint32_t)strtol(tokens[pos].start_lexeme, NULL, 10);
+    if (where_col != COLUMN_ID) {
+      free_expr(expr);
+      return NULL;
+    }
+    expr->intval = (uint32_t)strtol(tokens[*pos].start_lexeme, NULL, 10);
   } else {
     /* String literals only match the string columns. */
-    if (where_col == COLUMN_ID)
-      return PREPARE_FAILURE;
-    where_expr->strval = malloc(sizeof(char) * (tokens[pos].len_lexeme + 1));
-    memcpy(where_expr->strval, tokens[pos].start_lexeme,
-           tokens[pos].len_lexeme);
-    where_expr->strval[tokens[pos].len_lexeme] = '\0';
+    if (where_col == COLUMN_ID) {
+      free_expr(expr);
+      return NULL;
+    }
+    expr->strval = malloc(sizeof(char) * (tokens[*pos].len_lexeme + 1));
+    memcpy(expr->strval, tokens[*pos].start_lexeme, tokens[*pos].len_lexeme);
+    expr->strval[tokens[*pos].len_lexeme] = '\0';
   }
-  if (tokens[++pos].type == TOKEN_EOF)
-    return PREPARE_SUCCESS;
-  return PREPARE_FAILURE;
+  (*pos)++;
+  return expr;
 }
+
+Expr *parse_and(Token *tokens, uint32_t *pos) {
+  Expr *left = parse_comparison(tokens, pos);
+  if (left == NULL)
+    return NULL;
+
+  while (tokens[*pos].type == TOKEN_KW_AND) {
+    (*pos)++; /* consume AND */
+    Expr *right = parse_comparison(tokens, pos);
+    if (right == NULL) {
+      free_expr(left);
+      return NULL;
+    }
+    Expr *node = malloc(sizeof(Expr));
+    node->kind = AND_EXPR;
+    node->left = left;
+    node->right = right;
+    node->strval = NULL;
+    left = node;
+  }
+
+  return left;
+}
+
+Expr *parse_or(Token *tokens, uint32_t *pos) { return parse_and(tokens, pos); }
+
+Expr *parse_expr(Token *tokens, uint32_t *pos) { return parse_or(tokens, pos); }
 
 PrepareStatus parse_statement(Token *tokens, Statement *statement) {
   switch (tokens[0].type) {
@@ -1861,9 +1918,12 @@ PrepareStatus parse_statement(Token *tokens, Statement *statement) {
       return PREPARE_SUCCESS;
     if (tokens[1].type == TOKEN_OP_ALL) {
       if (tokens[2].type == TOKEN_KW_WHERE) {
-        Expr where_expr;
-        if (parse_where(&where_expr, tokens, 2) == PREPARE_FAILURE)
+        uint32_t wpos = 3; /* first token after WHERE */
+        Expr *where_expr = parse_expr(tokens, &wpos);
+        if (where_expr == NULL || tokens[wpos].type != TOKEN_EOF) {
+          free_expr(where_expr);
           return PREPARE_FAILURE;
+        }
         statement->has_where = 1;
         statement->where_expr = where_expr;
         return PREPARE_SUCCESS;
@@ -1875,7 +1935,7 @@ PrepareStatus parse_statement(Token *tokens, Statement *statement) {
     size_t pos = 1;
     while (1) {
       if (tokens[pos].type != TOKEN_IDENTIFIER ||
-           statement->projection_count >= MAX_SELECT_COLUMNS)
+          statement->projection_count >= MAX_SELECT_COLUMNS)
         return PREPARE_FAILURE;
 
       ColumnId col;
@@ -1887,9 +1947,12 @@ PrepareStatus parse_statement(Token *tokens, Statement *statement) {
       if (tokens[pos].type == TOKEN_EOF)
         return PREPARE_SUCCESS;
       if (tokens[pos].type == TOKEN_KW_WHERE) {
-        Expr where_expr;
-        if (parse_where(&where_expr, tokens, pos) == PREPARE_FAILURE)
+        uint32_t wpos = pos + 1; /* first token after WHERE */
+        Expr *where_expr = parse_expr(tokens, &wpos);
+        if (where_expr == NULL || tokens[wpos].type != TOKEN_EOF) {
+          free_expr(where_expr);
           return PREPARE_FAILURE;
+        }
         statement->has_where = 1;
         statement->where_expr = where_expr;
         return PREPARE_SUCCESS;
@@ -1951,6 +2014,10 @@ Token classify_word(const char *start, size_t len) {
     return (Token){TOKEN_KW_DELETE, (char *)start, len};
   if (len == 5 && strncmp(start, "where", 5) == 0)
     return (Token){TOKEN_KW_WHERE, (char *)start, len};
+  if (len == 3 && strncmp(start, "and", 3) == 0)
+    return (Token){TOKEN_KW_AND, (char *)start, len};
+  if (len == 2 && strncmp(start, "or", 2) == 0)
+    return (Token){TOKEN_KW_OR, (char *)start, len};
 
   for (size_t i = 0; i < len; i++) {
     if (!isdigit((unsigned char)start[i]))
