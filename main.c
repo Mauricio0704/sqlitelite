@@ -63,6 +63,10 @@ typedef enum {
   TOKEN_KW_OR,
   TOKEN_OP_ALL,
   TOKEN_OP_EQUAL,
+  TOKEN_OP_SMALLER,
+  TOKEN_OP_GREATER,
+  TOKEN_OP_SEQ,
+  TOKEN_OP_GEQ,
   TOKEN_COMMA,
   TOKEN_IDENTIFIER,
   TOKEN_INT_LITERAL,
@@ -1246,16 +1250,36 @@ ExecuteStatus execute_insert(Statement *statement, Table *table) {
   return EXECUTE_SUCCESS;
 }
 
+uint8_t apply_operator(TokenType operator, int cmp) {
+  switch (operator) {
+  case TOKEN_OP_SMALLER:
+    return cmp < 0;
+  case TOKEN_OP_GREATER:
+    return cmp > 0;
+  case TOKEN_OP_GEQ:
+    return cmp >= 0;
+  case TOKEN_OP_SEQ:
+    return cmp <= 0;
+  default: /* TOKEN_OP_EQUAL */
+    return cmp == 0;
+  }
+}
+
 uint8_t row_matches(Expr *where_expr, Record record) {
   switch (where_expr->kind) {
   case COMPARISON:
     switch (where_expr->col) {
-    case COLUMN_ID:
-      return record.id == where_expr->intval;
+    case COLUMN_ID: {
+      int cmp =
+          (record.id > where_expr->intval) - (record.id < where_expr->intval);
+      return apply_operator(where_expr->operator, cmp);
+    }
     case COLUMN_EMAIL:
-      return strcmp(record.email, where_expr->strval) == 0;
+      return apply_operator(where_expr->operator,
+                            strcmp(record.email, where_expr->strval));
     case COLUMN_USERNAME:
-      return strcmp(record.username, where_expr->strval) == 0;
+      return apply_operator(where_expr->operator,
+                            strcmp(record.username, where_expr->strval));
     }
     return 0;
   case AND_EXPR:
@@ -1279,7 +1303,6 @@ void free_expr(Expr *expr) {
   free(expr);
 }
 
-/* Print all records in the table in ascending key order. */
 void execute_select(Statement *statement, Table *table) {
   Cursor *cursor = new_cursor_start(table);
 
@@ -1842,9 +1865,13 @@ Expr *parse_comparison(Token *tokens, uint32_t *pos) {
   if (!resolve_column(tokens[*pos], &where_col))
     return NULL;
   (*pos)++;
-
-  if (tokens[*pos].type != TOKEN_OP_EQUAL)
+  TokenType op;
+  if (tokens[*pos].type != TOKEN_OP_EQUAL &&
+      tokens[*pos].type != TOKEN_OP_GREATER &&
+      tokens[*pos].type != TOKEN_OP_SMALLER &&
+      tokens[*pos].type != TOKEN_OP_GEQ && tokens[*pos].type != TOKEN_OP_SEQ)
     return NULL;
+  op = tokens[*pos].type;
   (*pos)++;
 
   if (!is_value_token(tokens[*pos].type))
@@ -1856,7 +1883,7 @@ Expr *parse_comparison(Token *tokens, uint32_t *pos) {
   expr->right = NULL;
   expr->strval = NULL;
   expr->col = where_col;
-  expr->operator = TOKEN_OP_EQUAL;
+  expr->operator = op;
 
   if (tokens[*pos].type == TOKEN_INT_LITERAL) {
     /* Only the integer column may be compared against an int literal. */
@@ -1902,7 +1929,26 @@ Expr *parse_and(Token *tokens, uint32_t *pos) {
   return left;
 }
 
-Expr *parse_or(Token *tokens, uint32_t *pos) { return parse_and(tokens, pos); }
+Expr *parse_or(Token *tokens, uint32_t *pos) {
+  Expr *left = parse_and(tokens, pos);
+
+  while (tokens[*pos].type == TOKEN_KW_OR) {
+    (*pos)++; /* consume OR */
+    Expr *right = parse_and(tokens, pos);
+    if (right == NULL) {
+      free_expr(left);
+      return NULL;
+    }
+    Expr *node = malloc(sizeof(Expr));
+    node->kind = OR_EXPR;
+    node->left = left;
+    node->right = right;
+    node->strval = NULL;
+    left = node;
+  }
+
+  return left;
+}
 
 Expr *parse_expr(Token *tokens, uint32_t *pos) { return parse_or(tokens, pos); }
 
@@ -2042,7 +2088,7 @@ Token *lexer(const char *line) {
   for (size_t i = 0; i <= line_len; i++) {
     char c = line[i]; /* line[line_len] is the terminating '\0' */
     int at_end = (i == line_len);
-    int is_punct = (c == ',' || c == '=' || c == '*');
+    int is_punct = (c == ',' || c == '=' || c == '*' || c == '>' || c == '<');
 
     /* A word token ends at whitespace, at single-char punctuation, or at the
      * terminating '\0'. Punctuation is then emitted as its own token. */
@@ -2050,7 +2096,9 @@ Token *lexer(const char *line) {
       if (i > start)
         tokens[curr_token++] = classify_word(line + start, i - start);
       if (is_punct) {
+        const char *lexeme = line + i; /* fixed before i advances below */
         TokenType type;
+        uint32_t len = 1;
         switch (c) {
         case ',':
           type = TOKEN_COMMA;
@@ -2061,8 +2109,24 @@ Token *lexer(const char *line) {
         case '*':
           type = TOKEN_OP_ALL;
           break;
+        case '>':
+          type = TOKEN_OP_GREATER;
+          if (line[i + 1] == '=') {
+            type = TOKEN_OP_GEQ;
+            len = 2;
+            i += 1;
+          }
+          break;
+        case '<':
+          type = TOKEN_OP_SMALLER;
+          if (line[i + 1] == '=') {
+            type = TOKEN_OP_SEQ;
+            len = 2;
+            i += 1;
+          }
+          break;
         }
-        tokens[curr_token++] = (Token){type, (char *)(line + i), 1};
+        tokens[curr_token++] = (Token){type, (char *)lexeme, len};
       }
       start = i + 1;
     }
