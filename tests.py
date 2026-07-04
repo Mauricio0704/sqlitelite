@@ -340,6 +340,68 @@ class TestWhere(DBTestCase):
             ],
         )
 
+    # --- comparison operators: <, >, <=, >= --------------------------------
+
+    def test_where_int_greater_than(self):
+        lines = self.run_cmds(self._people() + ["select id where id > 1", ".exit"])
+        self.assertEqual(self._rows(lines), ["(2)", "(3)"])
+
+    def test_where_int_less_than(self):
+        lines = self.run_cmds(self._people() + ["select id where id < 3", ".exit"])
+        self.assertEqual(self._rows(lines), ["(1)", "(2)"])
+
+    def test_where_int_greater_or_equal_includes_boundary(self):
+        # >= must include the equal row; > must not.
+        geq = self._rows(
+            self.run_cmds(self._people() + ["select id where id >= 2", ".exit"])
+        )
+        gt = self._rows(
+            self.run_cmds(self._people() + ["select id where id > 2", ".exit"])
+        )
+        self.assertEqual(geq, ["(2)", "(3)"])
+        self.assertEqual(gt, ["(3)"])
+
+    def test_where_int_less_or_equal_includes_boundary(self):
+        leq = self._rows(
+            self.run_cmds(self._people() + ["select id where id <= 2", ".exit"])
+        )
+        lt = self._rows(
+            self.run_cmds(self._people() + ["select id where id < 2", ".exit"])
+        )
+        self.assertEqual(leq, ["(1)", "(2)"])
+        self.assertEqual(lt, ["(1)"])
+
+    def test_where_int_range_with_and(self):
+        # Half-open-ish range: 1 < id <= 3  ->  ids 2 and 3.
+        lines = self.run_cmds(
+            self._people() + ["select id where id > 1 and id <= 3", ".exit"]
+        )
+        self.assertEqual(self._rows(lines), ["(2)", "(3)"])
+
+    # --- lexicographic comparison on string columns ------------------------
+
+    def test_where_string_less_than_is_lexicographic(self):
+        # alice < bob alphabetically; carol is not.
+        lines = self.run_cmds(self._people() + ["select name where name < bob", ".exit"])
+        self.assertEqual(self._rows(lines), ["(alice)"])
+
+    def test_where_string_greater_than_is_lexicographic(self):
+        lines = self.run_cmds(self._people() + ["select name where name > bob", ".exit"])
+        self.assertEqual(self._rows(lines), ["(carol)"])
+
+    def test_where_string_greater_or_equal_includes_boundary(self):
+        lines = self.run_cmds(
+            self._people() + ["select name where name >= bob", ".exit"]
+        )
+        self.assertEqual(self._rows(lines), ["(bob)", "(carol)"])
+
+    def test_where_email_column_less_than_is_lexicographic(self):
+        # Emails sort a < b < c, matching the insert order.
+        lines = self.run_cmds(
+            self._people() + ["select id where email < bob@example.com", ".exit"]
+        )
+        self.assertEqual(self._rows(lines), ["(1)"])
+
 
 # ---------------------------------------------------------------------------
 # 4. Persistence
