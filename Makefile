@@ -1,13 +1,25 @@
-CC = gcc
-CFLAGS = -std=c99
-TARGET = mini-db
+CC      := cc
+CFLAGS  := -Wall -Wextra -g
+BIN     := mini-db
 
-all: $(TARGET)
+OBJS := main.o lexer.o parser.o pager.o wal.o btree.o executor.o
 
-$(TARGET): main.c
-	$(CC) $(CFLAGS) -o $(TARGET) main.c
+HEADERS := common.h lexer.h parser.h pager.h wal.h btree.h executor.h
+
+.PHONY: all test clean
+
+all: $(BIN)
+
+$(BIN): $(OBJS)
+	$(CC) $(CFLAGS) -o $@ $(OBJS)
+
+# Pattern rule: any X.c -> X.o, rebuilt if any header changes.
+%.o: %.c $(HEADERS)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+# Build then run the Python test suite against the fresh binary.
+test: $(BIN)
+	python3 -m unittest tests.py
 
 clean:
-	rm -f $(TARGET)
-
-.PHONY: all clean
+	rm -f $(OBJS) $(BIN)

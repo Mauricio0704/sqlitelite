@@ -1,0 +1,158 @@
+#ifndef BTREE_H
+#define BTREE_H
+
+#include "common.h"
+#include "pager.h"
+
+#include <stdint.h>
+
+#define size_of_attribute(Struct, Attribute) sizeof(((Struct *)0)->Attribute)
+
+/* Record field sizes/offsets. enum (not `const`) so these are true compile-time
+ * constants with no linkage — a header-defined `const` has external linkage in
+ * C and would collide across the TUs that include this header. */
+enum {
+  ID_SIZE = size_of_attribute(Record, id),
+  USERNAME_SIZE = size_of_attribute(Record, username),
+  EMAIL_SIZE = size_of_attribute(Record, email),
+
+  ID_OFFSET = 0,
+  USERNAME_OFFSET = ID_OFFSET + ID_SIZE,
+  EMAIL_OFFSET = USERNAME_OFFSET + USERNAME_SIZE,
+
+  RECORD_SIZE = ID_SIZE + USERNAME_SIZE + EMAIL_SIZE,
+  RECORDS_PER_PAGE = (PAGE_SIZE / RECORD_SIZE),
+};
+
+typedef enum {
+  NODE_TYPE_INTERNAL,
+  NODE_TYPE_LEAF,
+  NODE_TYPE_INDEFINITE
+} NodeType;
+
+typedef struct {
+  uint32_t page_num;
+  uint32_t slot_num;
+  Table *table;
+  int is_end_of_table;
+} Cursor;
+
+/* Node layout constants (all compile-time; see note above on enum vs const). */
+enum {
+  NODE_IS_ROOT_SIZE = sizeof(uint8_t),
+  NODE_IS_ROOT_OFFSET = 0,
+  NODE_TYPE_SIZE = sizeof(uint8_t),
+  NODE_TYPE_OFFSET = NODE_IS_ROOT_OFFSET + NODE_IS_ROOT_SIZE,
+  NODE_PARENT_POINTER_SIZE = sizeof(uint32_t),
+  NODE_PARENT_POINTER_OFFSET = NODE_TYPE_OFFSET + NODE_TYPE_SIZE,
+  COMMON_NODE_HEADER_SIZE =
+      NODE_IS_ROOT_SIZE + NODE_TYPE_SIZE + NODE_PARENT_POINTER_SIZE,
+
+  /* Internal node header */
+  INTERNAL_NODE_NUM_KEYS_SIZE = sizeof(uint32_t),
+  INTERNAL_NODE_NUM_KEYS_OFFSET = COMMON_NODE_HEADER_SIZE,
+  INTERNAL_NODE_RIGHTMOST_POINTER_SIZE = sizeof(uint32_t),
+  INTERNAL_NODE_RIGHTMOST_POINTER_OFFSET =
+      INTERNAL_NODE_NUM_KEYS_OFFSET + INTERNAL_NODE_NUM_KEYS_SIZE,
+  INTERNAL_NODE_HEADER_SIZE = COMMON_NODE_HEADER_SIZE +
+                              INTERNAL_NODE_NUM_KEYS_SIZE +
+                              INTERNAL_NODE_RIGHTMOST_POINTER_SIZE,
+  INTERNAL_NODE_MAX_KEYS = 3,
+
+  /* Internal node body */
+  INTERNAL_NODE_POINTER_SIZE = sizeof(uint32_t),
+  INTERNAL_NODE_POINTER_OFFSET = 0,
+  INTERNAL_NODE_KEY_SIZE = sizeof(uint32_t),
+  INTERNAL_NODE_KEY_OFFSET =
+      INTERNAL_NODE_POINTER_OFFSET + INTERNAL_NODE_POINTER_SIZE,
+  INTERNAL_NODE_PAIR_SIZE = INTERNAL_NODE_KEY_SIZE + INTERNAL_NODE_POINTER_SIZE,
+
+  /* Leaf node header */
+  LEAF_NODE_NEXT_POINTER_SIZE = sizeof(uint32_t),
+  LEAF_NODE_NEXT_POINTER_OFFSET = COMMON_NODE_HEADER_SIZE,
+  LEAF_NODE_NUM_CELLS_SIZE = sizeof(uint32_t),
+  LEAF_NODE_NUM_CELLS_OFFSET =
+      LEAF_NODE_NEXT_POINTER_OFFSET + LEAF_NODE_NEXT_POINTER_SIZE,
+  LEAF_NODE_FREE_START_SIZE = sizeof(uint16_t),
+  LEAF_NODE_FREE_START_OFFSET =
+      LEAF_NODE_NUM_CELLS_OFFSET + LEAF_NODE_NUM_CELLS_SIZE,
+  LEAF_NODE_FREE_END_SIZE = sizeof(uint16_t),
+  LEAF_NODE_FREE_END_OFFSET =
+      LEAF_NODE_FREE_START_OFFSET + LEAF_NODE_FREE_START_SIZE,
+  LEAF_NODE_HEADER_SIZE =
+      COMMON_NODE_HEADER_SIZE + LEAF_NODE_NEXT_POINTER_SIZE +
+      LEAF_NODE_NUM_CELLS_SIZE + LEAF_NODE_FREE_START_SIZE +
+      LEAF_NODE_FREE_END_SIZE,
+
+  LEAF_NODE_SIZE = PAGE_SIZE,
+
+  /* Leaf node body */
+  LEAF_NODE_SLOT_SIZE = sizeof(uint16_t),
+  LEAF_NODE_CELL_KEY_SIZE = sizeof(uint32_t),
+  LEAF_NODE_CELL_KEY_OFFSET = 0,
+  LEAF_NODE_CELL_VALUE_SIZE = RECORD_SIZE,
+  LEAF_NODE_CELL_VALUE_OFFSET =
+      LEAF_NODE_CELL_KEY_OFFSET + LEAF_NODE_CELL_KEY_SIZE,
+  LEAF_NODE_SPACE_FOR_CELLS = LEAF_NODE_SIZE - LEAF_NODE_HEADER_SIZE,
+  LEAF_NODE_CELL_SIZE = LEAF_NODE_CELL_KEY_SIZE + LEAF_NODE_CELL_VALUE_SIZE,
+  LEAF_NODE_MAX_CELLS = LEAF_NODE_SPACE_FOR_CELLS / LEAF_NODE_CELL_SIZE,
+  LEAF_NODE_MIN_CELLS = LEAF_NODE_MAX_CELLS / 2,
+  INTERNAL_NODE_MIN_KEYS = INTERNAL_NODE_MAX_KEYS / 2,
+};
+
+uint8_t *node_is_root_value(void *node);
+uint8_t *node_type_value(void *node);
+uint32_t *node_parent(void *node);
+uint32_t *internal_node_num_keys(void *node);
+uint32_t *internal_node_rightmost_pointer(void *node);
+uint32_t *internal_node_key(void *node, uint32_t key_num);
+uint32_t *internal_node_pointer(void *node, uint32_t key_num);
+uint32_t *leaf_node_num_cells(void *node);
+uint16_t *leaf_node_free_start(void *node);
+uint16_t *leaf_node_free_end(void *node);
+uint32_t *leaf_node_next_pointer(void *node);
+uint16_t *leaf_node_offset_value(void *node, uint16_t slot_num);
+uint32_t leaf_node_key_at_slot(void *node, uint32_t slot_num);
+void *get_record_start(Cursor *cursor);
+Cursor *new_cursor_start(Table *table);
+void advance_cursor(Cursor *cursor);
+void initialize_node(void *node, NodeType node_type);
+void initialize_internal_node(void *node);
+void initialize_leaf_node(void *node);
+Cursor *leaf_node_offset_find(Table *table, uint32_t page_num, uint32_t key);
+void write_serialized_record(Record *source, void *destination);
+void read_deserialized_record(void *source, Record *destination);
+void internal_node_insert_key(Pager *pager, uint32_t parent_page_num,
+                              uint32_t promoted_key, uint32_t left_child_page,
+                              uint32_t right_child_page);
+void internal_node_split(Pager *pager, uint32_t node_page_num, uint32_t new_key,
+                         uint32_t new_left_child, uint32_t new_right_child);
+                         void leaf_node_insert(Cursor *cursor, uint32_t key, Record *record);
+void leaf_node_split(Cursor *cursor, void *node, uint32_t key, Record *record);
+void leaf_node_insert(Cursor *cursor, uint32_t key, Record *record);
+Cursor *find_key_cursor(Table *table, uint32_t key, int *key_exists);
+uint32_t leaf_node_read_all_cells(void *node, uint32_t *keys_out,
+                                  Record *records_out);
+void leaf_node_rebuild(void *node, uint32_t *keys, Record *records,
+                       uint32_t count, uint32_t next_ptr);
+int32_t find_child_index_in_parent(void *parent, uint32_t child_page);
+uint32_t internal_node_child(void *node, uint32_t child_index);
+void internal_node_remove_key(void *node, uint32_t key_index);
+void collapse_root(Table *table);
+void leaf_node_redistribute(Pager *pager, uint32_t node_page_num,
+                            uint32_t sibling_page_num, uint32_t separator_index,
+                            int sibling_is_left);
+void leaf_node_merge(Pager *pager, uint32_t left_page_num,
+                     uint32_t right_page_num, uint32_t separator_index);
+uint32_t internal_node_num_children(void *node);
+void internal_node_redistribute(Pager *pager, uint32_t node_page_num,
+                                uint32_t sibling_page_num,
+                                uint32_t separator_index, int sibling_is_left);
+void internal_node_merge(Pager *pager, uint32_t left_page_num,
+                         uint32_t right_page_num, uint32_t separator_index);
+void handle_internal_node_underflow(Pager *pager, uint32_t page_num,
+                                    void *parent, int32_t child_idx,
+                                    uint32_t num_parent_keys);
+void handle_underflow(Pager *pager, Table *table, uint32_t page_num);
+
+#endif /* BTREE_H */

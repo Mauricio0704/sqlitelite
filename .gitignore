@@ -1,5 +1,6 @@
 __pycache__
 *.db
 *.db-wal
+*.o
 mini-db
 .DS_Store
