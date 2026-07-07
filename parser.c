@@ -193,20 +193,20 @@ PrepareStatus parse_statement(Token *tokens, Statement *statement) {
     }
 
     Record *record = &statement->record_to_insert;
-    /* Need room for a trailing '\0', so len must be strictly less than the
-     * field capacity. */
-    if (tokens[2].len_lexeme >= sizeof(record->username) ||
-        tokens[3].len_lexeme >= sizeof(record->email)) {
-      printf("Incorrect arguments for insert\n");
-      return PREPARE_FAILURE;
-    }
 
     statement->statement_type = STATEMENT_INSERT;
     record->id = (uint32_t)strtol(tokens[1].start_lexeme, NULL, 10);
+    
+    record->len_username = tokens[2].len_lexeme;
+    record->username = malloc(record->len_username + 1); /* +1 for '\0' */
     memcpy(record->username, tokens[2].start_lexeme, tokens[2].len_lexeme);
     record->username[tokens[2].len_lexeme] = '\0';
+
+    record->len_email = tokens[3].len_lexeme;
+    record->email = malloc(record->len_email + 1); /* +1 for '\0' */
     memcpy(record->email, tokens[3].start_lexeme, tokens[3].len_lexeme);
     record->email[tokens[3].len_lexeme] = '\0';
+
     return PREPARE_SUCCESS;
   }
 

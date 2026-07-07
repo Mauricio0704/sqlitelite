@@ -1,6 +1,7 @@
 #ifndef COMMON_H
 #define COMMON_H
 
+#include <stddef.h>
 #include <stdint.h>
 
 /* Shared vocabulary used across more than one module */
@@ -9,8 +10,10 @@
 
 typedef struct {
   uint32_t id;
-  char username[32];
-  char email[255];
+  uint32_t len_username;
+  uint32_t len_email;
+  char *username;
+  char *email;
 } Record;
 
 typedef enum {

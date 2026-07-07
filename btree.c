@@ -1,14 +1,9 @@
 #include "btree.h"
-#include <stdlib.h>
-#include <ctype.h>
-#include <fcntl.h>
 #include <stddef.h>
 #include <stdint.h>
-#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/types.h>
-#include <unistd.h>
-
 
 /* Returns a pointer to the node root flag field. */
 uint8_t *node_is_root_value(void *node) { return node + NODE_IS_ROOT_OFFSET; }
@@ -167,16 +162,46 @@ Cursor *leaf_node_offset_find(Table *table, uint32_t page_num, uint32_t key) {
 
 /* Serializes an in-memory Record into its fixed-width on-page layout. */
 void write_serialized_record(Record *source, void *destination) {
+  uint32_t ID_SIZE = sizeof(uint32_t);
+  uint32_t USERNAME_SIZE = source->len_username;
+  uint32_t EMAIL_SIZE = source->len_email;
+  uint32_t ID_OFFSET = 0;
+  uint32_t USERNAME_OFFSET = ID_OFFSET + ID_SIZE;
+  uint32_t EMAIL_OFFSET = USERNAME_OFFSET + USERNAME_SIZE + sizeof(uint32_t);
+
   memcpy(destination + ID_OFFSET, &(source->id), ID_SIZE);
-  memcpy(destination + USERNAME_OFFSET, &(source->username), USERNAME_SIZE);
-  memcpy(destination + EMAIL_OFFSET, &(source->email), EMAIL_SIZE);
+  memcpy(destination + ID_OFFSET + ID_SIZE, &(source->len_username),
+         sizeof(uint32_t));
+  memcpy(destination + USERNAME_OFFSET + sizeof(uint32_t), source->username,
+         USERNAME_SIZE);
+  memcpy(destination + EMAIL_OFFSET, &(source->len_email), sizeof(uint32_t));
+  memcpy(destination + EMAIL_OFFSET + sizeof(uint32_t), source->email,
+         EMAIL_SIZE);
 }
 
 /* Deserializes a fixed-width on-page record into an in-memory Record. */
 void read_deserialized_record(void *source, Record *destination) {
+  uint32_t ID_SIZE = sizeof(uint32_t);
+  uint32_t ID_OFFSET = 0;
+
   memcpy(&(destination->id), source + ID_OFFSET, ID_SIZE);
-  memcpy(&(destination->username), source + USERNAME_OFFSET, USERNAME_SIZE);
-  memcpy(&(destination->email), source + EMAIL_OFFSET, EMAIL_SIZE);
+
+  uint32_t USERNAME_OFFSET = ID_OFFSET + ID_SIZE;
+  uint32_t USERNAME_SIZE = *(uint32_t *)(source + USERNAME_OFFSET);
+  destination->username = malloc(USERNAME_SIZE + 1); /* +1 for '\0' */
+  memcpy(destination->username, source + USERNAME_OFFSET + sizeof(uint32_t),
+         USERNAME_SIZE);
+  destination->username[USERNAME_SIZE] = '\0';
+
+  uint32_t EMAIL_OFFSET = USERNAME_OFFSET + USERNAME_SIZE + sizeof(uint32_t);
+  uint32_t EMAIL_SIZE = *(uint32_t *)(source + EMAIL_OFFSET);
+  destination->email = malloc(EMAIL_SIZE + 1); /* +1 for '\0' */
+  memcpy(destination->email, source + EMAIL_OFFSET + sizeof(uint32_t),
+         EMAIL_SIZE);
+  destination->email[EMAIL_SIZE] = '\0';
+
+  destination->len_username = USERNAME_SIZE;
+  destination->len_email = EMAIL_SIZE;
 }
 
 /* Inserts a new key+child into a parent internal node that has room. */
@@ -498,7 +523,11 @@ void leaf_node_insert(Cursor *cursor, uint32_t key, Record *record) {
 
   uint32_t free_start = *leaf_node_free_start(node);
   uint32_t free_end = *leaf_node_free_end(node);
-  uint32_t required_space = LEAF_NODE_CELL_SIZE + LEAF_NODE_SLOT_SIZE;
+  uint32_t record_size = 3 * sizeof(uint32_t) +
+                         sizeof(char) * record->len_email +
+                         sizeof(char) * record->len_username;
+  uint32_t cell_size = LEAF_NODE_CELL_KEY_SIZE + record_size;
+  uint32_t required_space = cell_size + LEAF_NODE_SLOT_SIZE;
 
   if (free_end < free_start || (free_end - free_start) < required_space) {
     leaf_node_split(cursor, node, key, record);
@@ -508,7 +537,7 @@ void leaf_node_insert(Cursor *cursor, uint32_t key, Record *record) {
   uint32_t num_cells = *leaf_node_num_cells(node);
   uint32_t slot_index = cursor->slot_num;
 
-  uint32_t insertion_point = *leaf_node_free_end(node) - LEAF_NODE_CELL_SIZE;
+  uint32_t insertion_point = *leaf_node_free_end(node) - cell_size;
 
   for (uint32_t i = num_cells; i > slot_index; i--) {
     *leaf_node_offset_value(node, (uint16_t)i) =
@@ -518,7 +547,7 @@ void leaf_node_insert(Cursor *cursor, uint32_t key, Record *record) {
 
   *(leaf_node_num_cells(node)) += 1;
   *(leaf_node_free_start(node)) += LEAF_NODE_SLOT_SIZE;
-  *(leaf_node_free_end(node)) -= LEAF_NODE_CELL_SIZE;
+  *(leaf_node_free_end(node)) -= cell_size;
 
   uint8_t *cell = (uint8_t *)node + insertion_point;
   memcpy(cell, &key, LEAF_NODE_CELL_KEY_SIZE);
@@ -598,7 +627,11 @@ void leaf_node_rebuild(void *node, uint32_t *keys, Record *records,
   *leaf_node_next_pointer(node) = next_ptr;
 
   for (uint32_t i = 0; i < count; i++) {
-    uint32_t insertion_point = *leaf_node_free_end(node) - LEAF_NODE_CELL_SIZE;
+    uint32_t record_size = 3 * sizeof(uint32_t) +
+                           sizeof(char) * records[i].len_email +
+                           sizeof(char) * records[i].len_username;
+    uint32_t cell_size = LEAF_NODE_CELL_KEY_SIZE + record_size;
+    uint32_t insertion_point = *leaf_node_free_end(node) - cell_size;
     *leaf_node_offset_value(node, (uint16_t)i) = (uint16_t)insertion_point;
 
     uint8_t *cell = (uint8_t *)node + insertion_point;
@@ -607,7 +640,7 @@ void leaf_node_rebuild(void *node, uint32_t *keys, Record *records,
 
     *leaf_node_num_cells(node) += 1;
     *leaf_node_free_start(node) += LEAF_NODE_SLOT_SIZE;
-    *leaf_node_free_end(node) -= LEAF_NODE_CELL_SIZE;
+    *leaf_node_free_end(node) -= cell_size;
   }
 }
 
