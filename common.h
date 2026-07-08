@@ -8,13 +8,30 @@
 #define TABLE_MAX_PAGES 100
 #define PAGE_SIZE 4096
 
+typedef enum { INT, TEXT } ColumnType;
+
 typedef struct {
-  uint32_t id;
-  uint32_t len_username;
-  uint32_t len_email;
-  char *username;
-  char *email;
+  ColumnType type;
+  union {
+    uint32_t int_val;
+    struct {
+      uint32_t len;
+      char *str;
+    } text_val;
+  };
+} Value;
+
+typedef struct {
+  Value *values;
+  size_t num_values;
 } Record;
+
+typedef struct Schema {
+  ColumnType *column_types;
+  char **column_names;
+  size_t num_columns;
+  uint32_t pk_column;
+} Schema;
 
 typedef enum {
   PREPARE_SUCCESS,

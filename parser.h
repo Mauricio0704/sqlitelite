@@ -13,7 +13,7 @@ typedef enum { COLUMN_ID, COLUMN_USERNAME, COLUMN_EMAIL } ColumnId;
 typedef enum { COMPARISON, AND_EXPR, OR_EXPR } ExprKind;
 
 typedef struct Expr {
-  ColumnId col;
+  int col_idx;
   TokenType op_type;
   uint32_t intval;
   char *strval;
@@ -33,7 +33,7 @@ typedef struct {
   Expr *where_expr;
 } Statement;
 
-int  resolve_column(Token token, ColumnId *out);
+int  resolve_column(Token token, int *out);
 int  is_value_token(TokenType type);
 Expr *parse_comparison(Token *tokens, uint32_t *pos);
 Expr *parse_and(Token *tokens, uint32_t *pos);

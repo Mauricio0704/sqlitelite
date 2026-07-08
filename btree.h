@@ -6,24 +6,6 @@
 
 #include <stdint.h>
 
-#define size_of_attribute(Struct, Attribute) sizeof(((Struct *)0)->Attribute)
-
-/* Record field sizes/offsets. enum (not `const`) so these are true compile-time
- * constants with no linkage — a header-defined `const` has external linkage in
- * C and would collide across the TUs that include this header. */
-enum {
-  ID_SIZE = size_of_attribute(Record, id),
-  USERNAME_SIZE = size_of_attribute(Record, username),
-  EMAIL_SIZE = size_of_attribute(Record, email),
-
-  ID_OFFSET = 0,
-  USERNAME_OFFSET = ID_OFFSET + ID_SIZE,
-  EMAIL_OFFSET = USERNAME_OFFSET + USERNAME_SIZE,
-
-  RECORD_SIZE = ID_SIZE + USERNAME_SIZE + EMAIL_SIZE,
-  RECORDS_PER_PAGE = (PAGE_SIZE / RECORD_SIZE),
-};
-
 typedef enum {
   NODE_TYPE_INTERNAL,
   NODE_TYPE_LEAF,
@@ -90,13 +72,13 @@ enum {
   LEAF_NODE_SLOT_SIZE = sizeof(uint16_t),
   LEAF_NODE_CELL_KEY_SIZE = sizeof(uint32_t),
   LEAF_NODE_CELL_KEY_OFFSET = 0,
-  LEAF_NODE_CELL_VALUE_SIZE = RECORD_SIZE,
-  LEAF_NODE_CELL_VALUE_OFFSET =
-      LEAF_NODE_CELL_KEY_OFFSET + LEAF_NODE_CELL_KEY_SIZE,
   LEAF_NODE_SPACE_FOR_CELLS = LEAF_NODE_SIZE - LEAF_NODE_HEADER_SIZE,
-  LEAF_NODE_CELL_SIZE = LEAF_NODE_CELL_KEY_SIZE + LEAF_NODE_CELL_VALUE_SIZE,
-  LEAF_NODE_MAX_CELLS = LEAF_NODE_SPACE_FOR_CELLS / LEAF_NODE_CELL_SIZE,
-  LEAF_NODE_MIN_CELLS = LEAF_NODE_MAX_CELLS / 2,
+
+  /* Worst case */
+  LEAF_NODE_MIN_CELL_SIZE =
+      LEAF_NODE_CELL_KEY_SIZE + 3 * sizeof(uint32_t) + LEAF_NODE_SLOT_SIZE,
+  LEAF_NODE_MAX_CELLS = LEAF_NODE_SPACE_FOR_CELLS / LEAF_NODE_MIN_CELL_SIZE,
+  LEAF_NODE_MIN_CELLS = 4, /* Placeholder */
   INTERNAL_NODE_MIN_KEYS = INTERNAL_NODE_MAX_KEYS / 2,
 };
 
@@ -121,7 +103,7 @@ void initialize_internal_node(void *node);
 void initialize_leaf_node(void *node);
 Cursor *leaf_node_offset_find(Table *table, uint32_t page_num, uint32_t key);
 void write_serialized_record(Record *source, void *destination);
-void read_deserialized_record(void *source, Record *destination);
+void read_deserialized_record(void *source, Record *destination, Schema *schema);
 void internal_node_insert_key(Pager *pager, uint32_t parent_page_num,
                               uint32_t promoted_key, uint32_t left_child_page,
                               uint32_t right_child_page);
@@ -132,17 +114,17 @@ void leaf_node_split(Cursor *cursor, void *node, uint32_t key, Record *record);
 void leaf_node_insert(Cursor *cursor, uint32_t key, Record *record);
 Cursor *find_key_cursor(Table *table, uint32_t key, int *key_exists);
 uint32_t leaf_node_read_all_cells(void *node, uint32_t *keys_out,
-                                  Record *records_out);
+                                  Record *records_out, Schema *schema);
 void leaf_node_rebuild(void *node, uint32_t *keys, Record *records,
                        uint32_t count, uint32_t next_ptr);
 int32_t find_child_index_in_parent(void *parent, uint32_t child_page);
 uint32_t internal_node_child(void *node, uint32_t child_index);
 void internal_node_remove_key(void *node, uint32_t key_index);
 void collapse_root(Table *table);
-void leaf_node_redistribute(Pager *pager, uint32_t node_page_num,
+void leaf_node_redistribute(Schema *schema, Pager *pager, uint32_t node_page_num,
                             uint32_t sibling_page_num, uint32_t separator_index,
                             int sibling_is_left);
-void leaf_node_merge(Pager *pager, uint32_t left_page_num,
+void leaf_node_merge(Schema *schema, Pager *pager, uint32_t left_page_num,
                      uint32_t right_page_num, uint32_t separator_index);
 uint32_t internal_node_num_children(void *node);
 void internal_node_redistribute(Pager *pager, uint32_t node_page_num,

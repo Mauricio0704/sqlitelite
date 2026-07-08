@@ -1,4 +1,5 @@
 #include "btree.h"
+#include "common.h"
 #include <stddef.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -162,46 +163,64 @@ Cursor *leaf_node_offset_find(Table *table, uint32_t page_num, uint32_t key) {
 
 /* Serializes an in-memory Record into its fixed-width on-page layout. */
 void write_serialized_record(Record *source, void *destination) {
-  uint32_t ID_SIZE = sizeof(uint32_t);
-  uint32_t USERNAME_SIZE = source->len_username;
-  uint32_t EMAIL_SIZE = source->len_email;
-  uint32_t ID_OFFSET = 0;
-  uint32_t USERNAME_OFFSET = ID_OFFSET + ID_SIZE;
-  uint32_t EMAIL_OFFSET = USERNAME_OFFSET + USERNAME_SIZE + sizeof(uint32_t);
+  uint32_t CURR_OFFSET = 0;
 
-  memcpy(destination + ID_OFFSET, &(source->id), ID_SIZE);
-  memcpy(destination + ID_OFFSET + ID_SIZE, &(source->len_username),
-         sizeof(uint32_t));
-  memcpy(destination + USERNAME_OFFSET + sizeof(uint32_t), source->username,
-         USERNAME_SIZE);
-  memcpy(destination + EMAIL_OFFSET, &(source->len_email), sizeof(uint32_t));
-  memcpy(destination + EMAIL_OFFSET + sizeof(uint32_t), source->email,
-         EMAIL_SIZE);
+  for (int i = 0; i < source->num_values; i++) {
+    Value curr_value = source->values[i];
+    switch (curr_value.type) {
+    case INT:
+      memcpy(destination + CURR_OFFSET, &(curr_value.int_val),
+             sizeof(uint32_t));
+      CURR_OFFSET += sizeof(uint32_t);
+      break;
+    case TEXT:
+      memcpy(destination + CURR_OFFSET, &(curr_value.text_val.len),
+             sizeof(uint32_t));
+      CURR_OFFSET += sizeof(uint32_t);
+      size_t text_value_size = sizeof(char) * curr_value.text_val.len;
+      memcpy(destination + CURR_OFFSET, curr_value.text_val.str,
+             text_value_size);
+      CURR_OFFSET += text_value_size;
+      break;
+    default:
+      break;
+    }
+  }
 }
 
 /* Deserializes a fixed-width on-page record into an in-memory Record. */
-void read_deserialized_record(void *source, Record *destination) {
-  uint32_t ID_SIZE = sizeof(uint32_t);
-  uint32_t ID_OFFSET = 0;
+void read_deserialized_record(void *source, Record *destination,
+                              Schema *schema) {
+  uint32_t CURR_OFFSET = 0;
+  uint32_t num_columns = schema->num_columns;
+  destination->num_values = num_columns;
+  destination->values = malloc(sizeof(Value) * destination->num_values);
 
-  memcpy(&(destination->id), source + ID_OFFSET, ID_SIZE);
-
-  uint32_t USERNAME_OFFSET = ID_OFFSET + ID_SIZE;
-  uint32_t USERNAME_SIZE = *(uint32_t *)(source + USERNAME_OFFSET);
-  destination->username = malloc(USERNAME_SIZE + 1); /* +1 for '\0' */
-  memcpy(destination->username, source + USERNAME_OFFSET + sizeof(uint32_t),
-         USERNAME_SIZE);
-  destination->username[USERNAME_SIZE] = '\0';
-
-  uint32_t EMAIL_OFFSET = USERNAME_OFFSET + USERNAME_SIZE + sizeof(uint32_t);
-  uint32_t EMAIL_SIZE = *(uint32_t *)(source + EMAIL_OFFSET);
-  destination->email = malloc(EMAIL_SIZE + 1); /* +1 for '\0' */
-  memcpy(destination->email, source + EMAIL_OFFSET + sizeof(uint32_t),
-         EMAIL_SIZE);
-  destination->email[EMAIL_SIZE] = '\0';
-
-  destination->len_username = USERNAME_SIZE;
-  destination->len_email = EMAIL_SIZE;
+  for (int i = 0; i < num_columns; i++) {
+    ColumnType curr_type = schema->column_types[i];
+    Value *curr_value = &(destination->values[i]);
+    switch (curr_type) {
+    case INT:
+      curr_value->type = INT;
+      memcpy(&(curr_value->int_val), source + CURR_OFFSET, sizeof(uint32_t));
+      CURR_OFFSET += sizeof(uint32_t);
+      break;
+    case TEXT:
+      curr_value->type = TEXT;
+      memcpy(&(curr_value->text_val.len), source + CURR_OFFSET,
+             sizeof(uint32_t));
+      CURR_OFFSET += sizeof(uint32_t);
+      size_t text_value_size = sizeof(char) * curr_value->text_val.len;
+      curr_value->text_val.str = malloc(text_value_size + 1);
+      memcpy(curr_value->text_val.str, source + CURR_OFFSET,
+             text_value_size);
+      curr_value->text_val.str[curr_value->text_val.len] = '\0';
+      CURR_OFFSET += text_value_size;
+      break;
+    default:
+      break;
+    }
+  }
 }
 
 /* Inserts a new key+child into a parent internal node that has room. */
@@ -423,7 +442,7 @@ void leaf_node_split(Cursor *cursor, void *node, uint32_t key, Record *record) {
     uint16_t cell_offset = *leaf_node_offset_value(node, (uint16_t)j);
     read_deserialized_record((uint8_t *)node + cell_offset +
                                  LEAF_NODE_CELL_KEY_SIZE,
-                             &all_records[i]);
+                             &all_records[i], cursor->table->schema);
     j++;
   }
 
@@ -516,6 +535,25 @@ void leaf_node_split(Cursor *cursor, void *node, uint32_t key, Record *record) {
   }
 }
 
+uint32_t leaf_node_cell_size(Record *record) {
+  uint32_t cell_size = LEAF_NODE_CELL_KEY_SIZE;
+  for (int i = 0; i < record->num_values; i++) {
+    Value curr_value = record->values[i];
+    switch (curr_value.type) {
+    case INT:
+      cell_size += sizeof(uint32_t);
+      break;
+    case TEXT:
+      cell_size += sizeof(uint32_t);
+      cell_size += sizeof(char) * curr_value.text_val.len;
+      break;
+    default:
+      break;
+    }
+  }
+  return cell_size;
+}
+
 /* Inserts a new cell into a leaf, splitting first when free space is exhausted.
  */
 void leaf_node_insert(Cursor *cursor, uint32_t key, Record *record) {
@@ -523,10 +561,7 @@ void leaf_node_insert(Cursor *cursor, uint32_t key, Record *record) {
 
   uint32_t free_start = *leaf_node_free_start(node);
   uint32_t free_end = *leaf_node_free_end(node);
-  uint32_t record_size = 3 * sizeof(uint32_t) +
-                         sizeof(char) * record->len_email +
-                         sizeof(char) * record->len_username;
-  uint32_t cell_size = LEAF_NODE_CELL_KEY_SIZE + record_size;
+  uint32_t cell_size = leaf_node_cell_size(record);
   uint32_t required_space = cell_size + LEAF_NODE_SLOT_SIZE;
 
   if (free_end < free_start || (free_end - free_start) < required_space) {
@@ -601,14 +636,14 @@ Cursor *find_key_cursor(Table *table, uint32_t key, int *key_exists) {
 /* Reads all cells from a leaf node into parallel key/record arrays.
    Returns the number of cells read. */
 uint32_t leaf_node_read_all_cells(void *node, uint32_t *keys_out,
-                                  Record *records_out) {
+                                  Record *records_out, Schema *schema) {
   uint32_t num_cells = *leaf_node_num_cells(node);
   for (uint32_t i = 0; i < num_cells; i++) {
     keys_out[i] = leaf_node_key_at_slot(node, i);
     uint16_t cell_offset = *leaf_node_offset_value(node, (uint16_t)i);
     read_deserialized_record((uint8_t *)node + cell_offset +
                                  LEAF_NODE_CELL_KEY_SIZE,
-                             &records_out[i]);
+                             &records_out[i], schema);
   }
   return num_cells;
 }
@@ -627,10 +662,7 @@ void leaf_node_rebuild(void *node, uint32_t *keys, Record *records,
   *leaf_node_next_pointer(node) = next_ptr;
 
   for (uint32_t i = 0; i < count; i++) {
-    uint32_t record_size = 3 * sizeof(uint32_t) +
-                           sizeof(char) * records[i].len_email +
-                           sizeof(char) * records[i].len_username;
-    uint32_t cell_size = LEAF_NODE_CELL_KEY_SIZE + record_size;
+    uint32_t cell_size = leaf_node_cell_size(&records[i]);
     uint32_t insertion_point = *leaf_node_free_end(node) - cell_size;
     *leaf_node_offset_value(node, (uint16_t)i) = (uint16_t)insertion_point;
 
@@ -736,19 +768,21 @@ void collapse_root(Table *table) {
   Called when a leaf drops below LEAF_NODE_MIN_CELLS but a sibling has
   more cells than LEAF_NODE_MIN_CELLS (so it can spare one).
 */
-void leaf_node_redistribute(Pager *pager, uint32_t node_page_num,
-                            uint32_t sibling_page_num, uint32_t separator_index,
-                            int sibling_is_left) {
+void leaf_node_redistribute(Schema *schema, Pager *pager,
+                            uint32_t node_page_num, uint32_t sibling_page_num,
+                            uint32_t separator_index, int sibling_is_left) {
   void *node = get_page(pager, node_page_num);
   void *sibling = get_page(pager, sibling_page_num);
 
   uint32_t node_keys[LEAF_NODE_MAX_CELLS + 1];
   Record node_records[LEAF_NODE_MAX_CELLS + 1];
-  uint32_t node_n = leaf_node_read_all_cells(node, node_keys, node_records);
+  uint32_t node_n =
+      leaf_node_read_all_cells(node, node_keys, node_records, schema);
 
   uint32_t sib_keys[LEAF_NODE_MAX_CELLS];
   Record sib_records[LEAF_NODE_MAX_CELLS];
-  uint32_t sib_n = leaf_node_read_all_cells(sibling, sib_keys, sib_records);
+  uint32_t sib_n =
+      leaf_node_read_all_cells(sibling, sib_keys, sib_records, schema);
 
   /* Move one cell from the sibling to the node. */
   if (sibling_is_left) {
@@ -787,20 +821,20 @@ void leaf_node_redistribute(Pager *pager, uint32_t node_page_num,
 }
 
 /* Merge the RIGHT leaf into the LEFT leaf */
-void leaf_node_merge(Pager *pager, uint32_t left_page_num,
+void leaf_node_merge(Schema *schema, Pager *pager, uint32_t left_page_num,
                      uint32_t right_page_num, uint32_t separator_index) {
   void *left_node = get_page(pager, left_page_num);
   void *right_node = get_page(pager, right_page_num);
 
   uint32_t left_node_keys[LEAF_NODE_MAX_CELLS + 1];
   Record left_node_records[LEAF_NODE_MAX_CELLS + 1];
-  uint32_t left_n =
-      leaf_node_read_all_cells(left_node, left_node_keys, left_node_records);
+  uint32_t left_n = leaf_node_read_all_cells(left_node, left_node_keys,
+                                             left_node_records, schema);
 
   uint32_t right_node_keys[LEAF_NODE_MAX_CELLS + 1];
   Record right_node_records[LEAF_NODE_MAX_CELLS + 1];
-  uint32_t right_n =
-      leaf_node_read_all_cells(right_node, right_node_keys, right_node_records);
+  uint32_t right_n = leaf_node_read_all_cells(right_node, right_node_keys,
+                                              right_node_records, schema);
 
   uint32_t all_keys[LEAF_NODE_MAX_CELLS + 1];
   Record all_records[LEAF_NODE_MAX_CELLS + 1];
@@ -1035,21 +1069,24 @@ void handle_underflow(Pager *pager, Table *table, uint32_t page_num) {
     /* Try redistribute first: pick a sibling above minimum. */
     if (has_left && *leaf_node_num_cells(get_page(pager, left_sib_page)) >
                         LEAF_NODE_MIN_CELLS) {
-      leaf_node_redistribute(pager, page_num, left_sib_page, left_sep, 1);
+      leaf_node_redistribute(table->schema, pager, page_num, left_sib_page,
+                             left_sep, 1);
       return;
     }
     if (has_right && *leaf_node_num_cells(get_page(pager, right_sib_page)) >
                          LEAF_NODE_MIN_CELLS) {
-      leaf_node_redistribute(pager, page_num, right_sib_page, right_sep, 0);
+      leaf_node_redistribute(table->schema, pager, page_num, right_sib_page,
+                             right_sep, 0);
       return;
     }
 
     /* No sibling can spare — merge. Convention: left receives, right is
        discarded. Decide which role the underflowed node plays. */
     if (has_left) {
-      leaf_node_merge(pager, left_sib_page, page_num, left_sep);
+      leaf_node_merge(table->schema, pager, left_sib_page, page_num, left_sep);
     } else {
-      leaf_node_merge(pager, page_num, right_sib_page, right_sep);
+      leaf_node_merge(table->schema, pager, page_num, right_sib_page,
+                      right_sep);
     }
   } else if (*node_type_value(node) == NODE_TYPE_INTERNAL) {
     handle_internal_node_underflow(pager, page_num, parent, child_idx,

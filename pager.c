@@ -5,7 +5,6 @@
 #include <stdlib.h>
 #include <unistd.h>
 
-
 /* Opens or creates the database file and initializes pager metadata. */
 Pager *new_pager(char *filename) {
   int fd = open(filename, O_RDWR | O_CREAT, S_IWUSR | S_IRUSR);
@@ -81,6 +80,10 @@ void close_db(Table *table) {
   wal_close(pager->wal);
   close(pager->fd);
   free(pager);
+
+  free(table->schema->column_types);
+  free(table->schema->column_names);
+  free(table->schema);
   free(table);
 }
 
@@ -115,6 +118,25 @@ void *get_page(Pager *pager, uint32_t page_num) {
   return pager->pages[page_num];
 }
 
+/* TEMPORARY  */
+static Schema *build_users_schema(void) {
+  Schema *schema = malloc(sizeof(Schema));
+  schema->num_columns = 3;
+  schema->pk_column = 0;
+
+  schema->column_types = malloc(sizeof(ColumnType) * schema->num_columns);
+  schema->column_types[0] = INT;
+  schema->column_types[1] = TEXT;
+  schema->column_types[2] = TEXT;
+
+  schema->column_names = malloc(sizeof(char *) * schema->num_columns);
+  schema->column_names[0] = "id";
+  schema->column_names[1] = "name";
+  schema->column_names[2] = "email";
+
+  return schema;
+}
+
 /* Opens the database file and ensures the root page is initialized. */
 Table *open_db(char *filename) {
   Pager *pager = new_pager(filename);
@@ -124,6 +146,7 @@ Table *open_db(char *filename) {
   Table *new_table = (Table *)malloc(sizeof(Table));
   new_table->pager = pager;
   new_table->root_page_num = 0;
+  new_table->schema = build_users_schema();
 
   if (pager->num_pages == 0) {
     void *root_node = get_page(pager, 0);

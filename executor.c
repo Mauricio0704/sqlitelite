@@ -1,14 +1,31 @@
 #include "executor.h"
+#include "common.h"
 #include <stdio.h>
-#include <string.h>
 #include <stdlib.h>
+#include <string.h>
 
 /* Reads and prints the record currently addressed by the cursor, emitting only
  * the projected columns in order. A count of 0 prints every column. */
-void print_row(Record record, const ColumnId *projection,
+void print_row(Record record, const ColumnId *projection_idxs,
                size_t projection_count) {
   if (projection_count == 0) {
-    printf("(%d, %s, %s)\n", record.id, record.username, record.email);
+    printf("(");
+    for (int i = 0; i < record.num_values; i++) {
+      if (i > 0)
+        printf(", ");
+      Value curr_value = record.values[i];
+      switch (curr_value.type) {
+      case INT:
+        printf("%d", curr_value.int_val);
+        break;
+      case TEXT:
+        printf("%s", curr_value.text_val.str);
+        break;
+      default:
+        break;
+      }
+    }
+    printf(")\n");
     return;
   }
 
@@ -16,15 +33,15 @@ void print_row(Record record, const ColumnId *projection,
   for (size_t i = 0; i < projection_count; i++) {
     if (i > 0)
       printf(", ");
-    switch (projection[i]) {
-    case COLUMN_ID:
-      printf("%d", record.id);
+    Value curr_value = record.values[projection_idxs[i]];
+    switch (curr_value.type) {
+    case INT:
+      printf("%d", curr_value.int_val);
       break;
-    case COLUMN_USERNAME:
-      printf("%s", record.username);
+    case TEXT:
+      printf("%s", curr_value.text_val.str);
       break;
-    case COLUMN_EMAIL:
-      printf("%s", record.email);
+    default:
       break;
     }
   }
@@ -37,13 +54,15 @@ ExecuteStatus execute_insert(Statement *statement, Table *table) {
   Record record = statement->record_to_insert;
 
   int key_exists;
-  Cursor *cursor = find_key_cursor(table, record.id, &key_exists);
+  Cursor *cursor = find_key_cursor(
+      table, record.values[table->schema->pk_column].int_val, &key_exists);
   if (key_exists) {
     free(cursor);
     return EXECUTE_DUPLICATE_KEY;
   }
 
-  leaf_node_insert(cursor, record.id, &record);
+  leaf_node_insert(cursor, record.values[table->schema->pk_column].int_val,
+                   &record);
 
   flush_to_wal(table->pager);
 
@@ -68,21 +87,22 @@ uint8_t apply_operator(TokenType operator, int cmp) {
 
 uint8_t row_matches(Expr *where_expr, Record record) {
   switch (where_expr->kind) {
-  case COMPARISON:
-    switch (where_expr->col) {
-    case COLUMN_ID: {
-      int cmp =
-          (record.id > where_expr->intval) - (record.id < where_expr->intval);
+  case COMPARISON: {
+    Value curr_val = record.values[where_expr->col_idx];
+    switch (curr_val.type) {
+    case INT: {
+      int cmp = (curr_val.int_val > where_expr->intval) -
+                (curr_val.int_val < where_expr->intval);
       return apply_operator(where_expr->op_type, cmp);
     }
-    case COLUMN_EMAIL:
+    case TEXT:
       return apply_operator(where_expr->op_type,
-                            strcmp(record.email, where_expr->strval));
-    case COLUMN_USERNAME:
-      return apply_operator(where_expr->op_type,
-                            strcmp(record.username, where_expr->strval));
+                            strcmp(curr_val.text_val.str, where_expr->strval));
+    default:
+      break;
     }
     return 0;
+  }
   case AND_EXPR:
     return row_matches(where_expr->left, record) &&
            row_matches(where_expr->right, record);
@@ -106,7 +126,7 @@ void execute_select(Statement *statement, Table *table) {
 
   while (!(cursor->is_end_of_table)) {
     Record record;
-    read_deserialized_record(get_record_start(cursor), &record);
+    read_deserialized_record(get_record_start(cursor), &record, table->schema);
     if (!statement->has_where || row_matches(statement->where_expr, record))
       print_row(record, statement->projection, statement->projection_count);
     advance_cursor(cursor);

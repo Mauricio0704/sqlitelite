@@ -18,6 +18,7 @@ typedef struct Pager {
 
 typedef struct {
   Pager *pager;
+  Schema *schema;
   uint32_t root_page_num;
 } Table;
 

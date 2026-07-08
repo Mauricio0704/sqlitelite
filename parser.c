@@ -1,4 +1,7 @@
 #include "parser.h"
+#include "common.h"
+#include "lexer.h"
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -14,8 +17,8 @@ void free_expr(Expr *expr) {
   free(expr);
 }
 
-/* Maps a column-name identifier to its ColumnId. Returns 1 on success. */
-int resolve_column(Token token, ColumnId *out) {
+/* Maps a column-name identifier to its column_index. Returns 1 on success. */
+int resolve_column(Token token, int *out) {
   if (token.len_lexeme == 2 && strncmp(token.start_lexeme, "id", 2) == 0)
     *out = COLUMN_ID;
   else if (token.len_lexeme == 4 && strncmp(token.start_lexeme, "name", 4) == 0)
@@ -28,15 +31,12 @@ int resolve_column(Token token, ColumnId *out) {
   return 1;
 }
 
-/* A value (in an INSERT) is any bare word: an identifier or an integer. The
- * unquoted grammar can't tell "alice" the name from a column name lexically, so
- * the parser accepts either in value position. */
 int is_value_token(TokenType type) {
   return type == TOKEN_IDENTIFIER || type == TOKEN_INT_LITERAL;
 }
 
 Expr *parse_comparison(Token *tokens, uint32_t *pos) {
-  ColumnId where_col;
+  int where_col;
   if (!resolve_column(tokens[*pos], &where_col))
     return NULL;
   (*pos)++;
@@ -57,7 +57,7 @@ Expr *parse_comparison(Token *tokens, uint32_t *pos) {
   expr->left = NULL;
   expr->right = NULL;
   expr->strval = NULL;
-  expr->col = where_col;
+  expr->col_idx = where_col;
   expr->op_type = op;
 
   if (tokens[*pos].type == TOKEN_INT_LITERAL) {
@@ -159,10 +159,10 @@ PrepareStatus parse_statement(Token *tokens, Statement *statement) {
           statement->projection_count >= MAX_SELECT_COLUMNS)
         return PREPARE_FAILURE;
 
-      ColumnId col;
-      if (!resolve_column(tokens[pos], &col))
+      int col_idx;
+      if (!resolve_column(tokens[pos], &col_idx))
         return PREPARE_FAILURE;
-      statement->projection[statement->projection_count++] = col;
+      statement->projection[statement->projection_count++] = col_idx;
       pos++;
 
       if (tokens[pos].type == TOKEN_EOF)
@@ -193,19 +193,37 @@ PrepareStatus parse_statement(Token *tokens, Statement *statement) {
     }
 
     Record *record = &statement->record_to_insert;
-
+    record->num_values = 0;
+    record->values = malloc(sizeof(Value) * 8); /* Placeholder */
     statement->statement_type = STATEMENT_INSERT;
-    record->id = (uint32_t)strtol(tokens[1].start_lexeme, NULL, 10);
-    
-    record->len_username = tokens[2].len_lexeme;
-    record->username = malloc(record->len_username + 1); /* +1 for '\0' */
-    memcpy(record->username, tokens[2].start_lexeme, tokens[2].len_lexeme);
-    record->username[tokens[2].len_lexeme] = '\0';
 
-    record->len_email = tokens[3].len_lexeme;
-    record->email = malloc(record->len_email + 1); /* +1 for '\0' */
-    memcpy(record->email, tokens[3].start_lexeme, tokens[3].len_lexeme);
-    record->email[tokens[3].len_lexeme] = '\0';
+    uint16_t token_idx = 1;
+    uint16_t col_idx = 0;
+    while (tokens[token_idx].type != TOKEN_EOF) {
+      Token curr_token = tokens[token_idx];
+      switch (curr_token.type) {
+      case TOKEN_INT_LITERAL:
+        record->values[token_idx - 1].type = INT;
+        record->values[token_idx - 1].int_val =
+            (uint32_t)strtol(curr_token.start_lexeme, NULL, 10);
+        record->num_values += 1;
+        break;
+      case TOKEN_IDENTIFIER: {
+        Value *curr_value = &(record->values[token_idx - 1]);
+        curr_value->type = TEXT;
+        curr_value->text_val.len = curr_token.len_lexeme;
+        curr_value->text_val.str = malloc(curr_value->text_val.len + 1);
+        memcpy(curr_value->text_val.str, curr_token.start_lexeme,
+               curr_token.len_lexeme);
+        curr_value->text_val.str[curr_token.len_lexeme] = '\0';
+        record->num_values += 1;
+        break;
+      }
+      default:
+        break;
+      }
+      token_idx += 1;
+    }
 
     return PREPARE_SUCCESS;
   }
