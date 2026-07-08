@@ -154,6 +154,7 @@ Table *open_db(char *filename) {
     *node_is_root_value(root_node) = 1;
     new_table->pager->num_pages = 1;
   }
+  new_table->rowid_counter = get_rightmost_rowid(new_table) + 1;
 
   return new_table;
 }

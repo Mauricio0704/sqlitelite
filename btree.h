@@ -102,14 +102,15 @@ void initialize_node(void *node, NodeType node_type);
 void initialize_internal_node(void *node);
 void initialize_leaf_node(void *node);
 Cursor *leaf_node_offset_find(Table *table, uint32_t page_num, uint32_t key);
+uint32_t get_rightmost_rowid(Table *table);
 void write_serialized_record(Record *source, void *destination);
 void read_deserialized_record(void *source, Record *destination, Schema *schema);
 void internal_node_insert_key(Pager *pager, uint32_t parent_page_num,
                               uint32_t promoted_key, uint32_t left_child_page,
                               uint32_t right_child_page);
 void internal_node_split(Pager *pager, uint32_t node_page_num, uint32_t new_key,
-                         uint32_t new_left_child, uint32_t new_right_child);
-                         void leaf_node_insert(Cursor *cursor, uint32_t key, Record *record);
+                         uint32_t new_right_child);
+void leaf_node_insert(Cursor *cursor, uint32_t key, Record *record);
 void leaf_node_split(Cursor *cursor, void *node, uint32_t key, Record *record);
 void leaf_node_insert(Cursor *cursor, uint32_t key, Record *record);
 Cursor *find_key_cursor(Table *table, uint32_t key, int *key_exists);

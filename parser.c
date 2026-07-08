@@ -198,7 +198,6 @@ PrepareStatus parse_statement(Token *tokens, Statement *statement) {
     statement->statement_type = STATEMENT_INSERT;
 
     uint16_t token_idx = 1;
-    uint16_t col_idx = 0;
     while (tokens[token_idx].type != TOKEN_EOF) {
       Token curr_token = tokens[token_idx];
       switch (curr_token.type) {

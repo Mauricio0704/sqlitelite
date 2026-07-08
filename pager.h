@@ -20,6 +20,7 @@ typedef struct {
   Pager *pager;
   Schema *schema;
   uint32_t root_page_num;
+  uint32_t rowid_counter;
 } Table;
 
 Pager *new_pager(char *filename);

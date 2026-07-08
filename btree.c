@@ -1,5 +1,6 @@
 #include "btree.h"
 #include "common.h"
+#include "pager.h"
 #include <stddef.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -161,11 +162,25 @@ Cursor *leaf_node_offset_find(Table *table, uint32_t page_num, uint32_t key) {
   return cursor;
 }
 
+/* Returns the largest key currently stored. */
+uint32_t get_rightmost_rowid(Table *table) {
+  void *node = get_page(table->pager, table->root_page_num);
+
+  while (*node_type_value(node) == NODE_TYPE_INTERNAL) {
+    node = get_page(table->pager, *internal_node_rightmost_pointer(node));
+  }
+
+  uint32_t num_cells = *leaf_node_num_cells(node);
+  if (num_cells == 0)
+    return 0;
+  return leaf_node_key_at_slot(node, num_cells - 1);
+}
+
 /* Serializes an in-memory Record into its fixed-width on-page layout. */
 void write_serialized_record(Record *source, void *destination) {
   uint32_t CURR_OFFSET = 0;
 
-  for (int i = 0; i < source->num_values; i++) {
+  for (size_t i = 0; i < source->num_values; i++) {
     Value curr_value = source->values[i];
     switch (curr_value.type) {
     case INT:
@@ -196,7 +211,7 @@ void read_deserialized_record(void *source, Record *destination,
   destination->num_values = num_columns;
   destination->values = malloc(sizeof(Value) * destination->num_values);
 
-  for (int i = 0; i < num_columns; i++) {
+  for (size_t i = 0; i < num_columns; i++) {
     ColumnType curr_type = schema->column_types[i];
     Value *curr_value = &(destination->values[i]);
     switch (curr_type) {
@@ -212,8 +227,7 @@ void read_deserialized_record(void *source, Record *destination,
       CURR_OFFSET += sizeof(uint32_t);
       size_t text_value_size = sizeof(char) * curr_value->text_val.len;
       curr_value->text_val.str = malloc(text_value_size + 1);
-      memcpy(curr_value->text_val.str, source + CURR_OFFSET,
-             text_value_size);
+      memcpy(curr_value->text_val.str, source + CURR_OFFSET, text_value_size);
       curr_value->text_val.str[curr_value->text_val.len] = '\0';
       CURR_OFFSET += text_value_size;
       break;
@@ -261,7 +275,7 @@ void internal_node_insert_key(Pager *pager, uint32_t parent_page_num,
 /* Splits a full internal node, promotes the middle key, and redistributes
    keys/children. Handles both root and non-root nodes correctly. */
 void internal_node_split(Pager *pager, uint32_t node_page_num, uint32_t new_key,
-                         uint32_t new_left_child, uint32_t new_right_child) {
+                         uint32_t new_right_child) {
   void *node = get_page(pager, node_page_num);
   uint32_t old_num_keys = *internal_node_num_keys(node);
   uint32_t total_keys = old_num_keys + 1;
@@ -407,8 +421,7 @@ void internal_node_split(Pager *pager, uint32_t node_page_num, uint32_t new_key,
     /* Insert promoted key into parent. */
     void *parent = get_page(pager, old_parent_page);
     if (*internal_node_num_keys(parent) >= INTERNAL_NODE_MAX_KEYS) {
-      internal_node_split(pager, old_parent_page, promoted_key, node_page_num,
-                          right_page_num);
+      internal_node_split(pager, old_parent_page, promoted_key, right_page_num);
     } else {
       internal_node_insert_key(pager, old_parent_page, promoted_key,
                                node_page_num, right_page_num);
@@ -512,7 +525,7 @@ void leaf_node_split(Cursor *cursor, void *node, uint32_t key, Record *record) {
 
     if (*internal_node_num_keys(parent_node) >= INTERNAL_NODE_MAX_KEYS) {
       internal_node_split(pager, old_parent_page_num, separator_key,
-                          left_page_num, right_page_num);
+                          right_page_num);
       return;
     }
 
@@ -537,7 +550,7 @@ void leaf_node_split(Cursor *cursor, void *node, uint32_t key, Record *record) {
 
 uint32_t leaf_node_cell_size(Record *record) {
   uint32_t cell_size = LEAF_NODE_CELL_KEY_SIZE;
-  for (int i = 0; i < record->num_values; i++) {
+  for (size_t i = 0; i < record->num_values; i++) {
     Value curr_value = record->values[i];
     switch (curr_value.type) {
     case INT:

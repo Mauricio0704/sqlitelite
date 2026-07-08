@@ -1,4 +1,5 @@
 #include "executor.h"
+#include "btree.h"
 #include "common.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -10,7 +11,7 @@ void print_row(Record record, const ColumnId *projection_idxs,
                size_t projection_count) {
   if (projection_count == 0) {
     printf("(");
-    for (int i = 0; i < record.num_values; i++) {
+    for (size_t i = 0; i < record.num_values; i++) {
       if (i > 0)
         printf(", ");
       Value curr_value = record.values[i];
@@ -53,18 +54,26 @@ void print_row(Record record, const ColumnId *projection_idxs,
 ExecuteStatus execute_insert(Statement *statement, Table *table) {
   Record record = statement->record_to_insert;
 
+  /* INTEGER PRIMARY KEY uses the supplied value, otherwise rowid. */
+  Value pk_value = record.values[table->schema->pk_column];
+  uint32_t key =
+      (pk_value.type == INT) ? pk_value.int_val : table->rowid_counter;
+
   int key_exists;
-  Cursor *cursor = find_key_cursor(
-      table, record.values[table->schema->pk_column].int_val, &key_exists);
+  Cursor *cursor = find_key_cursor(table, key, &key_exists);
   if (key_exists) {
     free(cursor);
     return EXECUTE_DUPLICATE_KEY;
   }
 
-  leaf_node_insert(cursor, record.values[table->schema->pk_column].int_val,
-                   &record);
+  leaf_node_insert(cursor, key, &record);
 
   flush_to_wal(table->pager);
+
+  /* Keep the counter above every key inserted, so auto-assigned rowids never
+     collide with or regress behind an explicit id. */
+  if (key >= table->rowid_counter)
+    table->rowid_counter = key + 1;
 
   free(cursor);
   return EXECUTE_SUCCESS;
