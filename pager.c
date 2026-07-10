@@ -1,8 +1,14 @@
 #include "pager.h"
 #include "btree.h"
+#include "common.h"
+#include "lexer.h"
+#include "parser.h"
+#include <_string.h>
 #include <fcntl.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <sys/types.h>
 #include <unistd.h>
 
 /* Opens or creates the database file and initializes pager metadata. */
@@ -137,24 +143,76 @@ static Schema *build_users_schema(void) {
   return schema;
 }
 
+void load_catalog(Database *database, Pager *pager) {
+  Schema *schema = malloc(sizeof(Schema));
+  schema->num_columns = 4;
+  schema->pk_column = UINT32_MAX;
+
+  schema->column_types = malloc(sizeof(ColumnType) * schema->num_columns);
+  schema->column_types[0] = INT;
+  schema->column_types[1] = TEXT;
+  schema->column_types[2] = TEXT;
+  schema->column_types[3] = INT;
+
+  schema->column_names = malloc(sizeof(char *) * schema->num_columns);
+  schema->column_names[0] = "type";
+  schema->column_names[1] = "name";
+  schema->column_names[2] = "create_statement";
+  schema->column_names[3] = "root_page_num";
+
+  database->num_tables = 1;
+  Table *catalog_table = malloc(sizeof(Table));
+  catalog_table->table_name = strndup("catalog", 7);
+  catalog_table->pager = pager;
+  catalog_table->schema = schema;
+  catalog_table->root_page_num = 0;
+  catalog_table->rowid_counter =
+      pager->num_pages > 0 ? get_rightmost_rowid(catalog_table) : 0;
+  database->tables[0] = catalog_table;
+}
+
 /* Opens the database file and ensures the root page is initialized. */
-Table *open_db(char *filename) {
-  Pager *pager = new_pager(filename);
+Database *open_db(char *filename) {
+  Pager *pager = new_pager(filename); /* Global pager */
 
   wal_recover(pager);
 
-  Table *new_table = (Table *)malloc(sizeof(Table));
-  new_table->pager = pager;
-  new_table->root_page_num = 0;
-  new_table->schema = build_users_schema();
+  Database *database = (Database *)malloc(sizeof(Database));
+  load_catalog(database, pager);
 
   if (pager->num_pages == 0) {
-    void *root_node = get_page(pager, 0);
-    initialize_leaf_node(root_node);
-    *node_is_root_value(root_node) = 1;
-    new_table->pager->num_pages = 1;
-  }
-  new_table->rowid_counter = get_rightmost_rowid(new_table) + 1;
+    void *catalog_node = get_page(pager, 0);
+    initialize_leaf_node(catalog_node);
+    *node_is_root_value(catalog_node) = 1;
+    pager->num_pages = 1;
+  } else {
+    /* read catalog */
+    void *catalog_node = get_page(pager, 0);
+    uint32_t num_cells = *leaf_node_num_cells(catalog_node);
+    uint32_t node_keys[num_cells];
+    Record node_records[num_cells];
+    Schema *schema = database->tables[0]->schema;
+    leaf_node_read_all_cells(catalog_node, node_keys, node_records, schema);
 
-  return new_table;
+    for (int i = 0; i < num_cells; i++) {
+      database->num_tables++;
+      database->tables[i + 1] = malloc(sizeof(Table));
+      Statement statement;
+      Token *tokens = lexer(node_records[i].values[2].text_val.str);
+      parse_statement(tokens, &statement);
+      database->tables[i + 1]->pager = pager;
+      database->tables[i + 1]->schema = malloc(sizeof(Schema));
+      memcpy(database->tables[i + 1]->schema, &(statement.schema),
+             sizeof(Schema));
+      database->tables[i + 1]->table_name =
+          strndup(node_records[i].values[1].text_val.str,
+                  node_records[i].values[1].text_val.len);
+      database->tables[i + 1]->root_page_num =
+          node_records[i].values[3].int_val;
+      database->tables[i + 1]->rowid_counter =
+          get_rightmost_rowid(database->tables[i + 1]);
+    }
+  }
+
+  return database;
 }

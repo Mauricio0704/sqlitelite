@@ -6,6 +6,22 @@
 
 // Classifies a word into a token:
 Token classify_word(const char *start, size_t len) {
+  if (len == 6 && strncmp(start, "create", 6) == 0)
+    return (Token){TOKEN_KW_CREATE, (char *)start, len};
+  if (len == 5 && strncmp(start, "table", 5) == 0)
+    return (Token){TOKEN_KW_TABLE, (char *)start, len};
+  if (len == 3 && strncmp(start, "int", 3) == 0)
+    return (Token){TOKEN_KW_INT, (char *)start, len};
+  if (len == 4 && strncmp(start, "into", 4) == 0)
+    return (Token){TOKEN_KW_INTO, (char *)start, len};
+  if (len == 4 && strncmp(start, "from", 4) == 0)
+    return (Token){TOKEN_KW_FROM, (char *)start, len};
+  if (len == 4 && strncmp(start, "text", 4) == 0)
+    return (Token){TOKEN_KW_TEXT, (char *)start, len};
+  if (len == 7 && strncmp(start, "primary", 7) == 0)
+    return (Token){TOKEN_KW_PRIMARY, (char *)start, len};
+  if (len == 3 && strncmp(start, "key", 3) == 0)
+    return (Token){TOKEN_KW_KEY, (char *)start, len};
   if (len == 6 && strncmp(start, "select", 6) == 0)
     return (Token){TOKEN_KW_SELECT, (char *)start, len};
   if (len == 6 && strncmp(start, "insert", 6) == 0)
@@ -42,7 +58,8 @@ Token *lexer(const char *line) {
   for (size_t i = 0; i <= line_len; i++) {
     char c = line[i]; /* line[line_len] is the terminating '\0' */
     int at_end = (i == line_len);
-    int is_punct = (c == ',' || c == '=' || c == '*' || c == '>' || c == '<');
+    int is_punct = (c == ',' || c == '=' || c == '*' || c == '>' || c == '<' ||
+                    c == '(' || c == ')');
 
     /* A word token ends at whitespace, at single-char punctuation, or at the
      * terminating '\0'. Punctuation is then emitted as its own token. */
@@ -62,6 +79,12 @@ Token *lexer(const char *line) {
           break;
         case '*':
           type = TOKEN_OP_ALL;
+          break;
+        case '(':
+          type = TOKEN_KW_LPAREN;
+          break;
+        case ')':
+          type = TOKEN_KW_RPAREN;
           break;
         case '>':
           type = TOKEN_OP_GREATER;

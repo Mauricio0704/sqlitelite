@@ -4,12 +4,22 @@
 #include <stddef.h>
 
  typedef enum {
+  TOKEN_KW_CREATE,
+  TOKEN_KW_TABLE,
+  TOKEN_KW_PRIMARY,
+  TOKEN_KW_KEY,
+  TOKEN_KW_INT,
+  TOKEN_KW_TEXT,
   TOKEN_KW_SELECT,
   TOKEN_KW_INSERT,
+  TOKEN_KW_INTO,
+  TOKEN_KW_FROM,
   TOKEN_KW_DELETE,
   TOKEN_KW_WHERE,
   TOKEN_KW_AND,
   TOKEN_KW_OR,
+  TOKEN_KW_LPAREN,
+  TOKEN_KW_RPAREN,
   TOKEN_OP_ALL,
   TOKEN_OP_EQUAL,
   TOKEN_OP_SMALLER,
@@ -21,6 +31,12 @@
   TOKEN_INT_LITERAL,
   TOKEN_EOF
 } TokenType;
+
+static const char * const token_type_names[] = {
+  "CREATE", "TABLE", "PRIMARY", "KEY", "INT", "TEXT", "SELECT", "INSERT",
+  "INTO", "FROM", "DELETE", "WHERE", "AND", "OR", "(", ")", "*", "=", "<", ">",
+  "<=", ">=", ",", "IDENTIFIER", "INT_LITERAL", "EOF"
+};
 
 typedef struct {
   TokenType type;

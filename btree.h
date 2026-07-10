@@ -112,7 +112,6 @@ void internal_node_split(Pager *pager, uint32_t node_page_num, uint32_t new_key,
                          uint32_t new_right_child);
 void leaf_node_insert(Cursor *cursor, uint32_t key, Record *record);
 void leaf_node_split(Cursor *cursor, void *node, uint32_t key, Record *record);
-void leaf_node_insert(Cursor *cursor, uint32_t key, Record *record);
 Cursor *find_key_cursor(Table *table, uint32_t key, int *key_exists);
 uint32_t leaf_node_read_all_cells(void *node, uint32_t *keys_out,
                                   Record *records_out, Schema *schema);

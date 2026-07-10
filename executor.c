@@ -1,6 +1,9 @@
 #include "executor.h"
 #include "btree.h"
 #include "common.h"
+#include "pager.h"
+#include "parser.h"
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -54,10 +57,14 @@ void print_row(Record record, const ColumnId *projection_idxs,
 ExecuteStatus execute_insert(Statement *statement, Table *table) {
   Record record = statement->record_to_insert;
 
-  /* INTEGER PRIMARY KEY uses the supplied value, otherwise rowid. */
-  Value pk_value = record.values[table->schema->pk_column];
-  uint32_t key =
-      (pk_value.type == INT) ? pk_value.int_val : table->rowid_counter;
+  uint32_t key;
+  uint32_t pk_col = table->schema->pk_column;
+
+  /* If PK is not defined or it is TEXT, should use rowid */
+  if (pk_col == UINT32_MAX || record.values[pk_col].type == TEXT)
+    key = table->rowid_counter;
+  else
+    key = record.values[pk_col].int_val;
 
   int key_exists;
   Cursor *cursor = find_key_cursor(table, key, &key_exists);
@@ -181,16 +188,80 @@ void execute_delete(Statement *statement, Table *table) {
   free(cursor);
 }
 
+void execute_create(Statement *statement, Table *table) {
+  table->schema = malloc(sizeof(Schema));
+  memcpy(table->schema, &statement->schema, sizeof(Schema));
+
+  void *catalog_node = get_page(table->pager, 0);
+
+  uint32_t num_tables = *leaf_node_num_cells(catalog_node);
+  if (num_tables >= MAX_TABLES)
+    return;
+
+  Record record;
+  record.num_values = 4;
+  record.values = malloc(sizeof(Value) * 4);
+  record.values[0] = (Value){INT, TABLE};
+  record.values[1].type = TEXT;
+  record.values[1].text_val.len = strlen(statement->create_t_name);
+  record.values[1].text_val.str =
+      strndup(statement->create_t_name, record.values[1].text_val.len);
+  record.values[2].type = TEXT;
+  if (statement->raw_create_stmt != NULL) {
+    record.values[2].text_val.str = strdup(statement->raw_create_stmt);
+    record.values[2].text_val.len =
+        (uint32_t)strlen(record.values[2].text_val.str);
+  } else {
+    record.values[2].text_val.str = NULL;
+    record.values[2].text_val.len = 0;
+  }
+  uint32_t rowid_cat = get_rightmost_rowid(table) + 1;
+  record.values[3] = (Value){INT, rowid_cat};
+  statement->record_to_insert = record;
+  execute_insert(statement, table);
+
+  void *new_table_node = get_page(table->pager, rowid_cat);
+  initialize_leaf_node(new_table_node);
+  *node_is_root_value(new_table_node) = 1;
+
+  table->pager->num_pages++;
+}
+
 /* Dispatches a prepared statement to its corresponding executor. */
-ExecuteStatus execute_statement(Statement *statement, Table *table) {
-  if (statement->statement_type == STATEMENT_INSERT) {
+ExecuteStatus execute_statement(Statement *statement, Database *database) {
+  Table *table = malloc(sizeof(Table));
+  for (int i = 0; i < database->num_tables; i++) {
+    if (strcmp(database->tables[i]->table_name, statement->table_name) == 0)
+      table = database->tables[i];
+  }
+  if (table == NULL) {
+    printf("Table not found");
+    return EXECUTE_SUCCESS;
+  }
+  switch (statement->statement_type) {
+  case STATEMENT_INSERT:
     return execute_insert(statement, table);
-  }
-  if (statement->statement_type == STATEMENT_SELECT) {
+  case STATEMENT_SELECT:
     execute_select(statement, table);
-  }
-  if (statement->statement_type == STATEMENT_DELETE) {
+    break;
+  case STATEMENT_DELETE:
     execute_delete(statement, table);
+    break;
+  case STATEMENT_CREATE:
+    execute_create(statement, table);
+    database->num_tables++;
+    database->tables[database->num_tables] = malloc(sizeof(Table));
+    database->tables[database->num_tables]->pager = table->pager;
+    database->tables[database->num_tables]->schema = malloc(sizeof(Schema));
+    memcpy(database->tables[database->num_tables]->schema, &(statement->schema),
+           sizeof(Schema));
+    database->tables[database->num_tables]->table_name =
+        strdup(statement->create_t_name);
+    database->tables[database->num_tables]->root_page_num =
+        table->pager->num_pages;
+    database->tables[database->num_tables]->rowid_counter =
+        get_rightmost_rowid(database->tables[database->num_tables]);
+    break;
   }
 
   return EXECUTE_SUCCESS;

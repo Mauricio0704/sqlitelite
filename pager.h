@@ -21,13 +21,19 @@ typedef struct {
   Schema *schema;
   uint32_t root_page_num;
   uint32_t rowid_counter;
+  char *table_name;
 } Table;
+
+typedef struct {
+  Table *tables[MAX_TABLES];
+  uint32_t num_tables;
+} Database;
 
 Pager *new_pager(char *filename);
 void  *get_page(Pager *pager, uint32_t page_num);
 void   flush_page(Pager *pager, uint32_t num_page);
 void   pager_mark_dirty(Pager *pager, uint32_t page_num);
-Table *open_db(char *filename);
+Database *open_db(char *filename);
 void   close_db(Table *table);
 
 #endif /* PAGER_H */

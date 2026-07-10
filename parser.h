@@ -31,6 +31,10 @@ typedef struct {
   size_t projection_count;
   int has_where;
   Expr *where_expr;
+  Schema schema;
+  char *table_name; /* Table where the operation is executed */
+  const char *raw_create_stmt; /* For CREATE TABLE, store the original statement */
+  char *create_t_name; /* For CREATE TABLE, store the table name */
 } Statement;
 
 int  resolve_column(Token token, int *out);

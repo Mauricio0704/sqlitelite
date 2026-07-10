@@ -1,3 +1,7 @@
+#include "common.h"
+#include "executor.h"
+#include "pager.h"
+#include "parser.h"
 #include <ctype.h>
 #include <fcntl.h>
 #include <stddef.h>
@@ -7,10 +11,6 @@
 #include <string.h>
 #include <sys/types.h>
 #include <unistd.h>
-#include "common.h"
-#include "parser.h"
-#include "pager.h"
-# include "executor.h"
 
 typedef struct {
   char *buffer;
@@ -73,14 +73,14 @@ int main(int argc, char *argv[]) {
   InputBuffer *input_buffer = new_input_buffer();
 
   char *filename = argv[1];
-  Table *table = open_db(filename);
+  Database *database = open_db(filename);
 
   while (1) {
     print_prompt();
     read_input(input_buffer);
 
     if (input_buffer->buffer[0] == '.') {
-      switch (execute_meta_command(input_buffer, table)) {
+      switch (execute_meta_command(input_buffer, database->tables[0])) {
       case META_COMMAND_SUCCESS:
         break;
 
@@ -97,15 +97,17 @@ int main(int argc, char *argv[]) {
       break;
 
     case PREPARE_FAILURE:
+      printf("Failure in statement\n");
       continue;
       break;
 
     case PREPARE_UNRECOGNIZED_COMMAND:
+      printf("Unrecognized command in statement \n");
       continue;
       break;
     }
 
-    switch (execute_statement(&statement, table)) {
+    switch (execute_statement(&statement, database)) {
     case EXECUTE_SUCCESS:
       printf("Executed\n");
       break;

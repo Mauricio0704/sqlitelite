@@ -7,6 +7,7 @@
 /* Shared vocabulary used across more than one module */
 #define TABLE_MAX_PAGES 100
 #define PAGE_SIZE 4096
+#define MAX_TABLES 5
 
 typedef enum { INT, TEXT } ColumnType;
 
@@ -25,6 +26,15 @@ typedef struct {
   Value *values;
   size_t num_values;
 } Record;
+
+typedef enum { TABLE } CatalogType;
+
+typedef struct {
+  char *table_name;
+  uint32_t root_page_num;
+  CatalogType type;
+  char *create_stmt;
+} CatalogEntry;
 
 typedef struct Schema {
   ColumnType *column_types;
@@ -49,7 +59,8 @@ typedef enum {
 typedef enum {
   STATEMENT_INSERT,
   STATEMENT_SELECT,
-  STATEMENT_DELETE
+  STATEMENT_DELETE,
+  STATEMENT_CREATE
 } StatementType;
 
 #endif /* COMMON_H */
