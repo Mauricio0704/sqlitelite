@@ -24,6 +24,33 @@ import unittest
 
 BINARY = os.path.join(os.path.dirname(__file__), "mini-db")
 
+# The single fixture table every table-based test operates on. Its columns are
+# id/name/email because resolve_column() still recognizes only those names.
+USERS_SCHEMA = "create table users (id int primary key, name text, email text)"
+
+
+def ins(id, name, email):
+    """Build a qualified INSERT for the users table."""
+    return f"insert into users {id} {name} {email}"
+
+
+def sel(cols="*", where=None):
+    """Build a qualified SELECT for the users table.
+
+    sel()                     -> select * from users
+    sel("id")                 -> select id from users
+    sel("*", "id = 2")        -> select * from users where id = 2
+    """
+    query = f"select {cols} from users"
+    if where is not None:
+        query += f" where {where}"
+    return query
+
+
+def dele(id):
+    """Build a qualified DELETE for the users table."""
+    return f"delete from users {id}"
+
 
 def run_db(commands: list[str], db_file: str) -> list[str]:
     """Feed *commands* line-by-line to the binary and return output lines."""
@@ -54,8 +81,12 @@ class DBTestCase(unittest.TestCase):
         if os.path.exists(self.db):
             os.unlink(self.db)
 
-    def run_cmds(self, commands: list[str]) -> list[str]:
-        return strip_prompts(run_db(commands, self.db))
+    def run_cmds(self, commands: list[str], create: bool = True) -> list[str]:
+        """Run a session. By default the users table is created first; pass
+        create=False for sessions that must not touch a table (meta commands,
+        reopen-only sessions, or tests asserting on raw create output)."""
+        prefix = [USERS_SCHEMA] if create else []
+        return strip_prompts(run_db(prefix + commands, self.db))
 
 
 # ---------------------------------------------------------------------------
@@ -70,18 +101,42 @@ class TestMetaCommands(DBTestCase):
         self.assertTrue(any("db > " in line for line in raw))
 
     def test_exit_terminates_cleanly(self):
-        lines = self.run_cmds([".exit"])
+        lines = self.run_cmds([".exit"], create=False)
         # No error output expected
         self.assertNotIn("Error", "\n".join(lines))
 
     def test_unrecognized_meta_command(self):
-        lines = self.run_cmds([".unknown", ".exit"])
+        lines = self.run_cmds([".unknown", ".exit"], create=False)
         self.assertIn("Unrecognized command", lines)
 
     def test_no_db_file_argument(self):
         result = subprocess.run([BINARY], capture_output=True, text=True)
         self.assertIn("You must supply a db file", result.stdout)
         self.assertNotEqual(result.returncode, 0)
+
+
+# ---------------------------------------------------------------------------
+# 1b. CREATE TABLE
+# ---------------------------------------------------------------------------
+
+
+class TestCreateTable(DBTestCase):
+
+    def test_create_returns_executed(self):
+        lines = self.run_cmds([".exit"])  # fixture already issues the CREATE
+        self.assertIn("Executed", lines)
+
+    def test_table_usable_immediately_after_create(self):
+        lines = self.run_cmds([ins(1, "alice", "a@x.com"), sel(), ".exit"])
+        self.assertIn("(1, alice, a@x.com)", lines)
+
+    def test_table_persists_across_restart(self):
+        # First session only creates the table (no rows), then reopen and use it.
+        run_db([USERS_SCHEMA, ".exit"], self.db)
+        lines = strip_prompts(
+            run_db([ins(1, "alice", "a@x.com"), sel(), ".exit"], self.db)
+        )
+        self.assertIn("(1, alice, a@x.com)", lines)
 
 
 # ---------------------------------------------------------------------------
@@ -92,38 +147,75 @@ class TestMetaCommands(DBTestCase):
 class TestInsertBasic(DBTestCase):
 
     def test_insert_returns_executed(self):
-        lines = self.run_cmds(["insert 1 alice alice@example.com", ".exit"])
+        lines = self.run_cmds([ins(1, "alice", "alice@example.com"), ".exit"])
         self.assertIn("Executed", lines)
-
-    def test_insert_missing_email(self):
-        lines = self.run_cmds(["insert 1 alice", ".exit"])
-        self.assertIn("Incorrect arguments for insert", lines)
-
-    def test_insert_missing_username_and_email(self):
-        lines = self.run_cmds(["insert 1", ".exit"])
-        self.assertIn("Incorrect arguments for insert", lines)
-
-    def test_insert_bare_keyword(self):
-        lines = self.run_cmds(["insert", ".exit"])
-        self.assertIn("Incorrect arguments for insert", lines)
-
-    def test_insert_non_numeric_id(self):
-        # sscanf will fail to parse, so args_assigned < 3
-        lines = self.run_cmds(["insert abc alice alice@example.com", ".exit"])
-        self.assertIn("Incorrect arguments for insert", lines)
 
     def test_duplicate_key_rejected(self):
         lines = self.run_cmds([
-            "insert 1 alice alice@example.com",
-            "insert 1 bob bob@example.com",
+            ins(1, "alice", "alice@example.com"),
+            ins(1, "bob", "bob@example.com"),
             ".exit",
         ])
         self.assertIn("Error: Duplicate key.", lines)
 
     def test_unrecognized_sql_command(self):
-        lines = self.run_cmds(["notacommand 1", ".exit"])
-        # No 'Executed' and no crash
+        # create=False so the fixture's own 'Executed' doesn't mask the check.
+        lines = self.run_cmds(["notacommand 1", ".exit"], create=False)
         self.assertNotIn("Executed", lines)
+
+
+# ---------------------------------------------------------------------------
+# 2b. Insert – schema validation
+#
+#     Re-adds the guardrail the old suite tested as "Incorrect arguments for
+#     insert". The engine must reject a row whose value count/types don't match
+#     the table schema instead of storing a malformed record. These assert on
+#     *behaviour* (the bad row is never stored -> select is empty), so they are
+#     independent of the exact rejection message you choose.
+#
+#     EXPECTED TO FAIL until execute_insert validates record_to_insert against
+#     table->schema (count + per-column type).
+# ---------------------------------------------------------------------------
+
+
+class TestInsertValidation(DBTestCase):
+    """Each test issues a malformed insert, then a known-good row, and asserts
+    that ONLY the good row survives. Requiring the good row to appear means a
+    crash on the malformed insert fails the test (rather than passing silently
+    because a dead process prints nothing); requiring the bad row to be absent
+    means a stored-but-malformed record also fails."""
+
+    GOOD = "(42, good, g@x.com)"
+
+    def _rows(self, lines):
+        return [l for l in lines if l.startswith("(")]
+
+    def _run(self, bad_insert):
+        return self._rows(self.run_cmds([
+            bad_insert,
+            ins(42, "good", "g@x.com"),
+            sel(),
+            ".exit",
+        ]))
+
+    def test_too_few_values_rejected(self):
+        # Missing the email column.
+        self.assertEqual(self._run("insert into users 1 alice"), [self.GOOD])
+
+    def test_no_values_rejected(self):
+        self.assertEqual(self._run("insert into users"), [self.GOOD])
+
+    def test_too_many_values_rejected(self):
+        self.assertEqual(
+            self._run("insert into users 1 alice a@x.com extra"), [self.GOOD]
+        )
+
+    def test_wrong_type_in_pk_column_rejected(self):
+        # 'abc' is text where the id column is INT. Currently SIGBUSes, which is
+        # exactly why this test insists the good row still appears afterward.
+        self.assertEqual(
+            self._run("insert into users abc alice a@x.com"), [self.GOOD]
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -134,24 +226,24 @@ class TestInsertBasic(DBTestCase):
 class TestSelectBasic(DBTestCase):
 
     def test_select_empty_table(self):
-        lines = self.run_cmds(["select", ".exit"])
+        lines = self.run_cmds([sel(), ".exit"])
         # Should not crash; 'Executed' is printed for select too
         self.assertIn("Executed", lines)
 
     def test_insert_then_select(self):
         lines = self.run_cmds([
-            "insert 1 alice alice@example.com",
-            "select",
+            ins(1, "alice", "alice@example.com"),
+            sel(),
             ".exit",
         ])
         self.assertIn("(1, alice, alice@example.com)", lines)
 
     def test_select_multiple_rows(self):
         lines = self.run_cmds([
-            "insert 3 charlie c@example.com",
-            "insert 1 alice a@example.com",
-            "insert 2 bob b@example.com",
-            "select",
+            ins(3, "charlie", "c@example.com"),
+            ins(1, "alice", "a@example.com"),
+            ins(2, "bob", "b@example.com"),
+            sel(),
             ".exit",
         ])
         rows = [l for l in lines if l.startswith("(")]
@@ -159,10 +251,10 @@ class TestSelectBasic(DBTestCase):
 
     def test_select_returns_sorted_order(self):
         lines = self.run_cmds([
-            "insert 30 charlie c@example.com",
-            "insert 10 alice a@example.com",
-            "insert 20 bob b@example.com",
-            "select",
+            ins(30, "charlie", "c@example.com"),
+            ins(10, "alice", "a@example.com"),
+            ins(20, "bob", "b@example.com"),
+            sel(),
             ".exit",
         ])
         rows = [l for l in lines if l.startswith("(")]
@@ -178,40 +270,40 @@ class TestSelectBasic(DBTestCase):
 class TestProjection(DBTestCase):
 
     def _one_row(self):
-        return ["insert 1 alice alice@example.com"]
+        return [ins(1, "alice", "alice@example.com")]
 
     def test_bare_select_returns_all_columns(self):
-        lines = self.run_cmds(self._one_row() + ["select", ".exit"])
+        lines = self.run_cmds(self._one_row() + [sel(), ".exit"])
         self.assertIn("(1, alice, alice@example.com)", lines)
 
     def test_project_single_column(self):
-        lines = self.run_cmds(self._one_row() + ["select id", ".exit"])
+        lines = self.run_cmds(self._one_row() + [sel("id"), ".exit"])
         self.assertIn("(1)", lines)
 
     def test_project_name_column(self):
-        lines = self.run_cmds(self._one_row() + ["select name", ".exit"])
+        lines = self.run_cmds(self._one_row() + [sel("name"), ".exit"])
         self.assertIn("(alice)", lines)
 
     def test_project_multiple_columns_in_order(self):
-        lines = self.run_cmds(self._one_row() + ["select id, email", ".exit"])
+        lines = self.run_cmds(self._one_row() + [sel("id, email"), ".exit"])
         self.assertIn("(1, alice@example.com)", lines)
 
     def test_projection_preserves_requested_order(self):
         # Reversed order must come out reversed, not in schema order.
-        lines = self.run_cmds(self._one_row() + ["select email, id", ".exit"])
+        lines = self.run_cmds(self._one_row() + [sel("email, id"), ".exit"])
         self.assertIn("(alice@example.com, 1)", lines)
 
     def test_projection_without_spaces_around_comma(self):
-        lines = self.run_cmds(self._one_row() + ["select id,email", ".exit"])
+        lines = self.run_cmds(self._one_row() + [sel("id,email"), ".exit"])
         self.assertIn("(1, alice@example.com)", lines)
 
     def test_repeated_column_allowed(self):
-        lines = self.run_cmds(self._one_row() + ["select id, id", ".exit"])
+        lines = self.run_cmds(self._one_row() + [sel("id, id"), ".exit"])
         self.assertIn("(1, 1)", lines)
 
     def test_unknown_column_rejected(self):
         # 'bogus' resolves to no column, so the select fails and emits no row.
-        lines = self.run_cmds(self._one_row() + ["select bogus", ".exit"])
+        lines = self.run_cmds(self._one_row() + [sel("bogus"), ".exit"])
         rows = [l for l in lines if l.startswith("(")]
         self.assertEqual(rows, [])
 
@@ -219,89 +311,83 @@ class TestProjection(DBTestCase):
         # Regression: column names must not be reserved words. Before generic
         # identifiers, 'id'/'name'/'email' as values broke the insert.
         lines = self.run_cmds([
-            "insert 1 id id@example.com",
-            "select",
+            ins(1, "id", "id@example.com"),
+            sel(),
             ".exit",
         ])
         self.assertIn("(1, id, id@example.com)", lines)
 
 
 class TestWhere(DBTestCase):
-    """WHERE-clause filtering.
-
-    The first block (single comparison, int/string, type-matching) exercises
-    behaviour that already exists. The AND/OR block is forward-looking: those
-    tests are expected to FAIL until the recursive expression tree is built,
-    and are meant as a progress ladder — each goes green as you implement it.
-    """
+    """WHERE-clause filtering."""
 
     def _people(self):
         return [
-            "insert 1 alice alice@example.com",
-            "insert 2 bob bob@example.com",
-            "insert 3 carol carol@example.com",
+            ins(1, "alice", "alice@example.com"),
+            ins(2, "bob", "bob@example.com"),
+            ins(3, "carol", "carol@example.com"),
         ]
 
     @staticmethod
     def _rows(lines):
         return [l for l in lines if l.startswith("(")]
 
-    # --- single comparison: already working -------------------------------
+    # --- single comparison ------------------------------------------------
 
     def test_where_int_selects_matching_row(self):
-        lines = self.run_cmds(self._people() + ["select * where id = 2", ".exit"])
+        lines = self.run_cmds(self._people() + [sel("*", "id = 2"), ".exit"])
         rows = self._rows(lines)
         self.assertEqual(rows, ["(2, bob, bob@example.com)"])
 
     def test_where_int_no_match_is_empty(self):
-        lines = self.run_cmds(self._people() + ["select * where id = 99", ".exit"])
+        lines = self.run_cmds(self._people() + [sel("*", "id = 99"), ".exit"])
         self.assertEqual(self._rows(lines), [])
 
     def test_where_matches_name_string(self):
-        lines = self.run_cmds(self._people() + ["select * where name = bob", ".exit"])
+        lines = self.run_cmds(self._people() + [sel("*", "name = bob"), ".exit"])
         self.assertEqual(self._rows(lines), ["(2, bob, bob@example.com)"])
 
     def test_where_matches_email_string(self):
         lines = self.run_cmds(
-            self._people() + ["select * where email = carol@example.com", ".exit"]
+            self._people() + [sel("*", "email = carol@example.com"), ".exit"]
         )
         self.assertEqual(self._rows(lines), ["(3, carol, carol@example.com)"])
 
     def test_where_combines_with_projection(self):
-        lines = self.run_cmds(self._people() + ["select name where id = 3", ".exit"])
+        lines = self.run_cmds(self._people() + [sel("name", "id = 3"), ".exit"])
         self.assertEqual(self._rows(lines), ["(carol)"])
 
     def test_where_string_no_match_is_empty(self):
-        lines = self.run_cmds(self._people() + ["select * where name = zoe", ".exit"])
+        lines = self.run_cmds(self._people() + [sel("*", "name = zoe"), ".exit"])
         self.assertEqual(self._rows(lines), [])
 
     def test_where_string_literal_on_int_column_rejected(self):
         # id is an int column; comparing it to a string must be rejected,
         # not silently return the wrong rows.
-        lines = self.run_cmds(self._people() + ["select * where id = bob", ".exit"])
+        lines = self.run_cmds(self._people() + [sel("*", "id = bob"), ".exit"])
         self.assertEqual(self._rows(lines), [])
 
     def test_where_int_literal_on_string_column_rejected(self):
-        lines = self.run_cmds(self._people() + ["select * where name = 5", ".exit"])
+        lines = self.run_cmds(self._people() + [sel("*", "name = 5"), ".exit"])
         self.assertEqual(self._rows(lines), [])
 
-    # --- AND / OR: progress ladder (expected to fail until implemented) ----
+    # --- AND / OR ---------------------------------------------------------
 
     def test_where_and_both_true(self):
         lines = self.run_cmds(
-            self._people() + ["select * where id = 1 and name = alice", ".exit"]
+            self._people() + [sel("*", "id = 1 and name = alice"), ".exit"]
         )
         self.assertEqual(self._rows(lines), ["(1, alice, alice@example.com)"])
 
     def test_where_and_one_false_is_empty(self):
         lines = self.run_cmds(
-            self._people() + ["select * where id = 1 and name = bob", ".exit"]
+            self._people() + [sel("*", "id = 1 and name = bob"), ".exit"]
         )
         self.assertEqual(self._rows(lines), [])
 
     def test_where_or_selects_either(self):
         lines = self.run_cmds(
-            self._people() + ["select * where id = 1 or id = 3", ".exit"]
+            self._people() + [sel("*", "id = 1 or id = 3"), ".exit"]
         )
         self.assertEqual(
             self._rows(lines),
@@ -310,7 +396,7 @@ class TestWhere(DBTestCase):
 
     def test_where_or_both_false_is_empty(self):
         lines = self.run_cmds(
-            self._people() + ["select * where id = 8 or id = 9", ".exit"]
+            self._people() + [sel("*", "id = 8 or id = 9"), ".exit"]
         )
         self.assertEqual(self._rows(lines), [])
 
@@ -320,7 +406,7 @@ class TestWhere(DBTestCase):
         # would be excluded. This test discriminates the grouping.
         lines = self.run_cmds(
             self._people()
-            + ["select * where id = 1 and name = alice or id = 3", ".exit"]
+            + [sel("*", "id = 1 and name = alice or id = 3"), ".exit"]
         )
         self.assertEqual(
             self._rows(lines),
@@ -329,7 +415,7 @@ class TestWhere(DBTestCase):
 
     def test_where_chained_or(self):
         lines = self.run_cmds(
-            self._people() + ["select * where id = 1 or id = 2 or id = 3", ".exit"]
+            self._people() + [sel("*", "id = 1 or id = 2 or id = 3"), ".exit"]
         )
         self.assertEqual(
             self._rows(lines),
@@ -343,30 +429,30 @@ class TestWhere(DBTestCase):
     # --- comparison operators: <, >, <=, >= --------------------------------
 
     def test_where_int_greater_than(self):
-        lines = self.run_cmds(self._people() + ["select id where id > 1", ".exit"])
+        lines = self.run_cmds(self._people() + [sel("id", "id > 1"), ".exit"])
         self.assertEqual(self._rows(lines), ["(2)", "(3)"])
 
     def test_where_int_less_than(self):
-        lines = self.run_cmds(self._people() + ["select id where id < 3", ".exit"])
+        lines = self.run_cmds(self._people() + [sel("id", "id < 3"), ".exit"])
         self.assertEqual(self._rows(lines), ["(1)", "(2)"])
 
     def test_where_int_greater_or_equal_includes_boundary(self):
         # >= must include the equal row; > must not.
         geq = self._rows(
-            self.run_cmds(self._people() + ["select id where id >= 2", ".exit"])
+            self.run_cmds(self._people() + [sel("id", "id >= 2"), ".exit"])
         )
         gt = self._rows(
-            self.run_cmds(self._people() + ["select id where id > 2", ".exit"])
+            self.run_cmds(self._people() + [sel("id", "id > 2"), ".exit"])
         )
         self.assertEqual(geq, ["(2)", "(3)"])
         self.assertEqual(gt, ["(3)"])
 
     def test_where_int_less_or_equal_includes_boundary(self):
         leq = self._rows(
-            self.run_cmds(self._people() + ["select id where id <= 2", ".exit"])
+            self.run_cmds(self._people() + [sel("id", "id <= 2"), ".exit"])
         )
         lt = self._rows(
-            self.run_cmds(self._people() + ["select id where id < 2", ".exit"])
+            self.run_cmds(self._people() + [sel("id", "id < 2"), ".exit"])
         )
         self.assertEqual(leq, ["(1)", "(2)"])
         self.assertEqual(lt, ["(1)"])
@@ -374,7 +460,7 @@ class TestWhere(DBTestCase):
     def test_where_int_range_with_and(self):
         # Half-open-ish range: 1 < id <= 3  ->  ids 2 and 3.
         lines = self.run_cmds(
-            self._people() + ["select id where id > 1 and id <= 3", ".exit"]
+            self._people() + [sel("id", "id > 1 and id <= 3"), ".exit"]
         )
         self.assertEqual(self._rows(lines), ["(2)", "(3)"])
 
@@ -382,23 +468,23 @@ class TestWhere(DBTestCase):
 
     def test_where_string_less_than_is_lexicographic(self):
         # alice < bob alphabetically; carol is not.
-        lines = self.run_cmds(self._people() + ["select name where name < bob", ".exit"])
+        lines = self.run_cmds(self._people() + [sel("name", "name < bob"), ".exit"])
         self.assertEqual(self._rows(lines), ["(alice)"])
 
     def test_where_string_greater_than_is_lexicographic(self):
-        lines = self.run_cmds(self._people() + ["select name where name > bob", ".exit"])
+        lines = self.run_cmds(self._people() + [sel("name", "name > bob"), ".exit"])
         self.assertEqual(self._rows(lines), ["(carol)"])
 
     def test_where_string_greater_or_equal_includes_boundary(self):
         lines = self.run_cmds(
-            self._people() + ["select name where name >= bob", ".exit"]
+            self._people() + [sel("name", "name >= bob"), ".exit"]
         )
         self.assertEqual(self._rows(lines), ["(bob)", "(carol)"])
 
     def test_where_email_column_less_than_is_lexicographic(self):
         # Emails sort a < b < c, matching the insert order.
         lines = self.run_cmds(
-            self._people() + ["select id where email < bob@example.com", ".exit"]
+            self._people() + [sel("id", "email < bob@example.com"), ".exit"]
         )
         self.assertEqual(self._rows(lines), ["(1)"])
 
@@ -411,57 +497,60 @@ class TestWhere(DBTestCase):
 class TestPersistence(DBTestCase):
 
     def test_data_survives_restart(self):
-        run_db(["insert 1 alice alice@example.com", ".exit"], self.db)
-        lines = strip_prompts(run_db(["select", ".exit"], self.db))
+        run_db([USERS_SCHEMA, ins(1, "alice", "alice@example.com"), ".exit"], self.db)
+        lines = strip_prompts(run_db([sel(), ".exit"], self.db))
         self.assertIn("(1, alice, alice@example.com)", lines)
 
     def test_multiple_records_survive_restart(self):
-        cmds = [f"insert {i} user{i} u{i}@x.com" for i in range(1, 6)]
-        run_db(cmds + [".exit"], self.db)
-        lines = strip_prompts(run_db(["select", ".exit"], self.db))
+        cmds = [ins(i, f"user{i}", f"u{i}@x.com") for i in range(1, 6)]
+        run_db([USERS_SCHEMA] + cmds + [".exit"], self.db)
+        lines = strip_prompts(run_db([sel(), ".exit"], self.db))
         rows = [l for l in lines if l.startswith("(")]
         self.assertEqual(len(rows), 5)
 
     def test_incremental_writes_persist(self):
-        run_db(["insert 1 alice a@x.com", ".exit"], self.db)
-        run_db(["insert 2 bob b@x.com", ".exit"], self.db)
-        lines = strip_prompts(run_db(["select", ".exit"], self.db))
+        run_db([USERS_SCHEMA, ins(1, "alice", "a@x.com"), ".exit"], self.db)
+        run_db([ins(2, "bob", "b@x.com"), ".exit"], self.db)
+        lines = strip_prompts(run_db([sel(), ".exit"], self.db))
         rows = [l for l in lines if l.startswith("(")]
         self.assertEqual(len(rows), 2)
 
     def test_duplicate_rejected_after_restart(self):
-        run_db(["insert 1 alice a@x.com", ".exit"], self.db)
+        run_db([USERS_SCHEMA, ins(1, "alice", "a@x.com"), ".exit"], self.db)
         lines = strip_prompts(
-            run_db(["insert 1 alice2 a2@x.com", ".exit"], self.db)
+            run_db([ins(1, "alice2", "a2@x.com"), ".exit"], self.db)
         )
         self.assertIn("Error: Duplicate key.", lines)
 
 
 # ---------------------------------------------------------------------------
 # 5. Field-length boundaries
+#
+#     TEXT is now variable-length (length-prefixed), so these are no longer
+#     hard size limits -- they just exercise long values round-tripping.
 # ---------------------------------------------------------------------------
 
 
 class TestFieldBoundaries(DBTestCase):
 
-    def test_max_username_length(self):
-        username = "a" * 31  # USERNAME_SIZE - 1 usable chars (null-terminated)
-        lines = self.run_cmds([f"insert 1 {username} x@x.com", "select", ".exit"])
+    def test_long_username(self):
+        username = "a" * 31
+        lines = self.run_cmds([ins(1, username, "x@x.com"), sel(), ".exit"])
         self.assertIn(f"(1, {username}, x@x.com)", lines)
 
-    def test_max_email_length(self):
-        email = "a" * 254  # EMAIL_SIZE - 1 usable chars
-        lines = self.run_cmds([f"insert 1 alice {email}", "select", ".exit"])
+    def test_long_email(self):
+        email = "a" * 254
+        lines = self.run_cmds([ins(1, "alice", email), sel(), ".exit"])
         self.assertIn(f"(1, alice, {email})", lines)
 
     def test_id_zero(self):
-        lines = self.run_cmds(["insert 0 zero z@x.com", "select", ".exit"])
+        lines = self.run_cmds([ins(0, "zero", "z@x.com"), sel(), ".exit"])
         rows = [l for l in lines if l.startswith("(")]
         self.assertEqual(len(rows), 1)
         self.assertIn("(0, zero, z@x.com)", lines)
 
     def test_large_id(self):
-        lines = self.run_cmds(["insert 999999 bigid big@x.com", "select", ".exit"])
+        lines = self.run_cmds([ins(999999, "bigid", "big@x.com"), sel(), ".exit"])
         self.assertIn("(999999, bigid, big@x.com)", lines)
 
 
@@ -478,8 +567,8 @@ class TestLeafNodeSplit(DBTestCase):
     SPLIT_COUNT = 14
 
     def _insert_n(self, n):
-        cmds = [f"insert {i} user{i} u{i}@x.com" for i in range(1, n + 1)]
-        return self.run_cmds(cmds + ["select", ".exit"])
+        cmds = [ins(i, f"user{i}", f"u{i}@x.com") for i in range(1, n + 1)]
+        return self.run_cmds(cmds + [sel(), ".exit"])
 
     def test_all_rows_returned_after_split(self):
         lines = self._insert_n(self.SPLIT_COUNT)
@@ -494,16 +583,16 @@ class TestLeafNodeSplit(DBTestCase):
 
     def test_no_data_loss_after_split_with_reverse_insert(self):
         cmds = [
-            f"insert {i} user{i} u{i}@x.com"
+            ins(i, f"user{i}", f"u{i}@x.com")
             for i in range(self.SPLIT_COUNT, 0, -1)
         ]
-        lines = self.run_cmds(cmds + ["select", ".exit"])
+        lines = self.run_cmds(cmds + [sel(), ".exit"])
         rows = [l for l in lines if l.startswith("(")]
         self.assertEqual(len(rows), self.SPLIT_COUNT)
 
     def test_duplicate_detection_still_works_after_split(self):
-        cmds = [f"insert {i} user{i} u{i}@x.com" for i in range(1, self.SPLIT_COUNT + 1)]
-        cmds.append("insert 7 dup dup@x.com")  # duplicate mid-tree
+        cmds = [ins(i, f"user{i}", f"u{i}@x.com") for i in range(1, self.SPLIT_COUNT + 1)]
+        cmds.append(ins(7, "dup", "dup@x.com"))  # duplicate mid-tree
         lines = self.run_cmds(cmds + [".exit"])
         self.assertIn("Error: Duplicate key.", lines)
 
@@ -521,8 +610,8 @@ class TestInternalNodeSplit(DBTestCase):
     DEEP_COUNT = 60
 
     def _insert_sequential(self, n):
-        cmds = [f"insert {i} user{i} u{i}@x.com" for i in range(1, n + 1)]
-        return self.run_cmds(cmds + ["select", ".exit"])
+        cmds = [ins(i, f"user{i}", f"u{i}@x.com") for i in range(1, n + 1)]
+        return self.run_cmds(cmds + [sel(), ".exit"])
 
     def test_all_rows_returned_after_internal_split(self):
         lines = self._insert_sequential(self.DEEP_COUNT)
@@ -536,9 +625,9 @@ class TestInternalNodeSplit(DBTestCase):
         self.assertEqual(ids, sorted(ids))
 
     def test_persistence_after_internal_split(self):
-        cmds = [f"insert {i} user{i} u{i}@x.com" for i in range(1, self.DEEP_COUNT + 1)]
-        run_db(cmds + [".exit"], self.db)
-        lines = strip_prompts(run_db(["select", ".exit"], self.db))
+        cmds = [ins(i, f"user{i}", f"u{i}@x.com") for i in range(1, self.DEEP_COUNT + 1)]
+        run_db([USERS_SCHEMA] + cmds + [".exit"], self.db)
+        lines = strip_prompts(run_db([sel(), ".exit"], self.db))
         rows = [l for l in lines if l.startswith("(")]
         self.assertEqual(len(rows), self.DEEP_COUNT)
 
@@ -547,8 +636,8 @@ class TestInternalNodeSplit(DBTestCase):
         ids = list(range(1, self.DEEP_COUNT + 1))
         # interleave: odd ids first, then even
         ordered = ids[::2] + ids[1::2]
-        cmds = [f"insert {i} user{i} u{i}@x.com" for i in ordered]
-        lines = self.run_cmds(cmds + ["select", ".exit"])
+        cmds = [ins(i, f"user{i}", f"u{i}@x.com") for i in ordered]
+        lines = self.run_cmds(cmds + [sel(), ".exit"])
         rows = [l for l in lines if l.startswith("(")]
         self.assertEqual(len(rows), self.DEEP_COUNT)
         parsed_ids = [int(r.split(",")[0].strip("( ")) for r in rows]
@@ -564,10 +653,10 @@ class TestEndToEnd(DBTestCase):
 
     def test_insert_select_exit_full_flow(self):
         lines = self.run_cmds([
-            "insert 10 alice alice@example.com",
-            "insert 5 bob bob@example.com",
-            "insert 20 charlie charlie@example.com",
-            "select",
+            ins(10, "alice", "alice@example.com"),
+            ins(5, "bob", "bob@example.com"),
+            ins(20, "charlie", "charlie@example.com"),
+            sel(),
             ".exit",
         ])
         rows = [l for l in lines if l.startswith("(")]
@@ -578,10 +667,10 @@ class TestEndToEnd(DBTestCase):
 
     def test_interleaved_inserts_and_selects(self):
         lines = self.run_cmds([
-            "insert 1 alice a@x.com",
-            "select",
-            "insert 2 bob b@x.com",
-            "select",
+            ins(1, "alice", "a@x.com"),
+            sel(),
+            ins(2, "bob", "b@x.com"),
+            sel(),
             ".exit",
         ])
         first_select = [l for l in lines if l.startswith("(")][0]
@@ -590,12 +679,12 @@ class TestEndToEnd(DBTestCase):
     def test_session_with_errors_continues(self):
         """Errors should not crash the REPL; subsequent commands still work."""
         lines = self.run_cmds([
-            "insert 1 alice a@x.com",
-            "insert 1 alice a@x.com",    # duplicate
-            ".badcmd",                   # bad meta
-            "garbage sql",               # unrecognized
-            "insert 2 bob b@x.com",
-            "select",
+            ins(1, "alice", "a@x.com"),
+            ins(1, "alice", "a@x.com"),    # duplicate
+            ".badcmd",                     # bad meta
+            "garbage sql",                 # unrecognized
+            ins(2, "bob", "b@x.com"),
+            sel(),
             ".exit",
         ])
         rows = [l for l in lines if l.startswith("(")]
@@ -603,8 +692,8 @@ class TestEndToEnd(DBTestCase):
 
     def test_large_dataset_end_to_end(self):
         n = 50
-        cmds = [f"insert {i} user{i} u{i}@example.com" for i in range(1, n + 1)]
-        lines = self.run_cmds(cmds + ["select", ".exit"])
+        cmds = [ins(i, f"user{i}", f"u{i}@example.com") for i in range(1, n + 1)]
+        lines = self.run_cmds(cmds + [sel(), ".exit"])
         rows = [l for l in lines if l.startswith("(")]
         self.assertEqual(len(rows), n)
         ids = [int(r.split(",")[0].strip("( ")) for r in rows]
@@ -614,10 +703,11 @@ class TestEndToEnd(DBTestCase):
         for batch in range(1, 4):
             start = (batch - 1) * 5 + 1
             end = batch * 5 + 1
-            cmds = [f"insert {i} user{i} u{i}@x.com" for i in range(start, end)]
-            run_db(cmds + [".exit"], self.db)
+            cmds = [ins(i, f"user{i}", f"u{i}@x.com") for i in range(start, end)]
+            prefix = [USERS_SCHEMA] if batch == 1 else []
+            run_db(prefix + cmds + [".exit"], self.db)
 
-        lines = strip_prompts(run_db(["select", ".exit"], self.db))
+        lines = strip_prompts(run_db([sel(), ".exit"], self.db))
         rows = [l for l in lines if l.startswith("(")]
         self.assertEqual(len(rows), 15)
 
@@ -632,11 +722,11 @@ class TestDeleteBasic(DBTestCase):
 
     def test_delete_single_key(self):
         lines = self.run_cmds([
-            "insert 1 alice a@x.com",
-            "insert 2 bob b@x.com",
-            "insert 3 charlie c@x.com",
-            "delete 2",
-            "select",
+            ins(1, "alice", "a@x.com"),
+            ins(2, "bob", "b@x.com"),
+            ins(3, "charlie", "c@x.com"),
+            dele(2),
+            sel(),
             ".exit",
         ])
         rows = [l for l in lines if l.startswith("(")]
@@ -645,19 +735,19 @@ class TestDeleteBasic(DBTestCase):
 
     def test_delete_nonexistent_key(self):
         lines = self.run_cmds([
-            "insert 1 alice a@x.com",
-            "delete 99",
+            ins(1, "alice", "a@x.com"),
+            dele(99),
             ".exit",
         ])
         self.assertIn("Key 99 does not exist", lines)
 
     def test_delete_first_key(self):
         lines = self.run_cmds([
-            "insert 1 alice a@x.com",
-            "insert 2 bob b@x.com",
-            "insert 3 charlie c@x.com",
-            "delete 1",
-            "select",
+            ins(1, "alice", "a@x.com"),
+            ins(2, "bob", "b@x.com"),
+            ins(3, "charlie", "c@x.com"),
+            dele(1),
+            sel(),
             ".exit",
         ])
         rows = [l for l in lines if l.startswith("(")]
@@ -666,11 +756,11 @@ class TestDeleteBasic(DBTestCase):
 
     def test_delete_last_key(self):
         lines = self.run_cmds([
-            "insert 1 alice a@x.com",
-            "insert 2 bob b@x.com",
-            "insert 3 charlie c@x.com",
-            "delete 3",
-            "select",
+            ins(1, "alice", "a@x.com"),
+            ins(2, "bob", "b@x.com"),
+            ins(3, "charlie", "c@x.com"),
+            dele(3),
+            sel(),
             ".exit",
         ])
         rows = [l for l in lines if l.startswith("(")]
@@ -679,9 +769,9 @@ class TestDeleteBasic(DBTestCase):
 
     def test_delete_only_key_in_root_leaf(self):
         lines = self.run_cmds([
-            "insert 1 alice a@x.com",
-            "delete 1",
-            "select",
+            ins(1, "alice", "a@x.com"),
+            dele(1),
+            sel(),
             ".exit",
         ])
         rows = [l for l in lines if l.startswith("(")]
@@ -689,11 +779,11 @@ class TestDeleteBasic(DBTestCase):
 
     def test_delete_then_reinsert(self):
         lines = self.run_cmds([
-            "insert 1 alice a@x.com",
-            "insert 2 bob b@x.com",
-            "delete 1",
-            "insert 1 alice2 a2@x.com",
-            "select",
+            ins(1, "alice", "a@x.com"),
+            ins(2, "bob", "b@x.com"),
+            dele(1),
+            ins(1, "alice2", "a2@x.com"),
+            sel(),
             ".exit",
         ])
         rows = [l for l in lines if l.startswith("(")]
@@ -702,13 +792,14 @@ class TestDeleteBasic(DBTestCase):
 
     def test_delete_persists_after_restart(self):
         run_db([
-            "insert 1 alice a@x.com",
-            "insert 2 bob b@x.com",
-            "insert 3 charlie c@x.com",
-            "delete 2",
+            USERS_SCHEMA,
+            ins(1, "alice", "a@x.com"),
+            ins(2, "bob", "b@x.com"),
+            ins(3, "charlie", "c@x.com"),
+            dele(2),
             ".exit",
         ], self.db)
-        lines = strip_prompts(run_db(["select", ".exit"], self.db))
+        lines = strip_prompts(run_db([sel(), ".exit"], self.db))
         rows = [l for l in lines if l.startswith("(")]
         ids = [int(r.split(",")[0].strip("( ")) for r in rows]
         self.assertEqual(ids, [1, 3])
@@ -726,13 +817,13 @@ class TestDeleteUnderflow(DBTestCase):
     """Delete operations that trigger underflow and require rebalancing."""
 
     def _insert_range(self, start, end):
-        return [f"insert {i} user{i} u{i}@x.com" for i in range(start, end)]
+        return [ins(i, f"user{i}", f"u{i}@x.com") for i in range(start, end)]
 
     def test_leaf_redistribute(self):
         """Insert 14 keys (split into two 7-cell leaves), then delete 2
         from one leaf to trigger redistribute from its sibling."""
         cmds = self._insert_range(1, 15)
-        cmds += ["delete 1", "delete 2", "select", ".exit"]
+        cmds += [dele(1), dele(2), sel(), ".exit"]
         lines = self.run_cmds(cmds)
         rows = [l for l in lines if l.startswith("(")]
         ids = [int(r.split(",")[0].strip("( ")) for r in rows]
@@ -742,8 +833,8 @@ class TestDeleteUnderflow(DBTestCase):
         """Delete enough keys to force a leaf merge."""
         cmds = self._insert_range(1, 15)
         for i in range(1, 9):
-            cmds.append(f"delete {i}")
-        cmds += ["select", ".exit"]
+            cmds.append(dele(i))
+        cmds += [sel(), ".exit"]
         lines = self.run_cmds(cmds)
         rows = [l for l in lines if l.startswith("(")]
         ids = [int(r.split(",")[0].strip("( ")) for r in rows]
@@ -754,8 +845,8 @@ class TestDeleteUnderflow(DBTestCase):
         n = 30
         cmds = self._insert_range(1, n + 1)
         for i in range(1, n + 1):
-            cmds.append(f"delete {i}")
-        cmds += ["select", ".exit"]
+            cmds.append(dele(i))
+        cmds += [sel(), ".exit"]
         lines = self.run_cmds(cmds)
         rows = [l for l in lines if l.startswith("(")]
         self.assertEqual(len(rows), 0)
@@ -765,8 +856,8 @@ class TestDeleteUnderflow(DBTestCase):
         n = 20
         cmds = self._insert_range(1, n + 1)
         for i in range(1, n - 2):
-            cmds.append(f"delete {i}")
-        cmds += ["select", ".exit"]
+            cmds.append(dele(i))
+        cmds += [sel(), ".exit"]
         lines = self.run_cmds(cmds)
         rows = [l for l in lines if l.startswith("(")]
         ids = [int(r.split(",")[0].strip("( ")) for r in rows]
@@ -776,11 +867,11 @@ class TestDeleteUnderflow(DBTestCase):
         """After rebalancing, inserts should still work correctly."""
         cmds = self._insert_range(1, 15)
         for i in range(1, 8):
-            cmds.append(f"delete {i}")
+            cmds.append(dele(i))
         cmds += [
-            "insert 100 new1 new1@x.com",
-            "insert 200 new2 new2@x.com",
-            "select",
+            ins(100, "new1", "new1@x.com"),
+            ins(200, "new2", "new2@x.com"),
+            sel(),
             ".exit",
         ]
         lines = self.run_cmds(cmds)
@@ -794,9 +885,9 @@ class TestDeleteUnderflow(DBTestCase):
         """Data must survive restart after rebalancing."""
         cmds = self._insert_range(1, 15)
         for i in range(1, 8):
-            cmds.append(f"delete {i}")
-        run_db(cmds + [".exit"], self.db)
-        lines = strip_prompts(run_db(["select", ".exit"], self.db))
+            cmds.append(dele(i))
+        run_db([USERS_SCHEMA] + cmds + [".exit"], self.db)
+        lines = strip_prompts(run_db([sel(), ".exit"], self.db))
         rows = [l for l in lines if l.startswith("(")]
         ids = [int(r.split(",")[0].strip("( ")) for r in rows]
         self.assertEqual(ids, list(range(8, 15)))
@@ -806,8 +897,8 @@ class TestDeleteUnderflow(DBTestCase):
         n = 60
         cmds = self._insert_range(1, n + 1)
         for i in range(1, 46):
-            cmds.append(f"delete {i}")
-        cmds += ["select", ".exit"]
+            cmds.append(dele(i))
+        cmds += [sel(), ".exit"]
         lines = self.run_cmds(cmds)
         rows = [l for l in lines if l.startswith("(")]
         ids = [int(r.split(",")[0].strip("( ")) for r in rows]
@@ -818,12 +909,13 @@ class TestDeleteUnderflow(DBTestCase):
         n = 30
         cmds = self._insert_range(1, n + 1)
         for i in range(1, n + 1, 2):
-            cmds.append(f"delete {i}")
-        cmds += ["select", ".exit"]
+            cmds.append(dele(i))
+        cmds += [sel(), ".exit"]
         lines = self.run_cmds(cmds)
         rows = [l for l in lines if l.startswith("(")]
         ids = [int(r.split(",")[0].strip("( ")) for r in rows]
         self.assertEqual(ids, list(range(2, n + 1, 2)))
+
 
 class TestWALRecovery(DBTestCase):
     """Write-Ahead Log recovery after a simulated crash.
@@ -833,6 +925,9 @@ class TestWALRecovery(DBTestCase):
     calls exit(EXIT_FAILURE) and never flushes. So feeding commands without a
     trailing `.exit` leaves the .db untouched and only the fsync'd WAL on disk
     — meaning anything recovered on the next open came from the WAL alone.
+
+    Each crashed session issues the CREATE first, so recovery must rebuild both
+    the catalog entry and the table's rows from the log.
     """
 
     def wal_path(self) -> str:
@@ -848,27 +943,27 @@ class TestWALRecovery(DBTestCase):
     def crash(self, commands: list[str]) -> None:
         """Run commands with NO `.exit`. The binary processes (and fsyncs) every
         command, then dies on EOF before flushing pages to the .db file."""
-        run_db(commands, self.db)
+        run_db([USERS_SCHEMA] + commands, self.db)
 
     def reopen_ids(self) -> list[int]:
         """Reopen cleanly, select everything, return the recovered key ids."""
-        lines = strip_prompts(run_db(["select", ".exit"], self.db))
+        lines = strip_prompts(run_db([sel(), ".exit"], self.db))
         rows = [l for l in lines if l.startswith("(")]
         return [int(r.split(",")[0].strip("( ")) for r in rows]
 
     @staticmethod
     def _inserts(lo: int, hi: int) -> list[str]:
-        return [f"insert {i} user{i} u{i}@x.com" for i in range(lo, hi)]
+        return [ins(i, f"user{i}", f"u{i}@x.com") for i in range(lo, hi)]
 
     def clean_exit(self, commands: list[str]) -> None:
         """Run commands followed by a clean `.exit`, so close_db flushes every
         page to the .db file, fsyncs, and checkpoints (truncates) the WAL."""
-        run_db(commands + [".exit"], self.db)
+        run_db([USERS_SCHEMA] + commands + [".exit"], self.db)
 
     # -- tests -------------------------------------------------------------
 
     def test_committed_inserts_survive_crash(self):
-        self.crash(["insert 1 alice a@x.com", "insert 2 bob b@x.com"])
+        self.crash([ins(1, "alice", "a@x.com"), ins(2, "bob", "b@x.com")])
         # Nothing was flushed to .db: recovery must restore from the WAL alone.
         self.assertEqual(os.path.getsize(self.db), 0)
         self.assertEqual(self.reopen_ids(), [1, 2])
@@ -880,19 +975,19 @@ class TestWALRecovery(DBTestCase):
 
     def test_committed_deletes_survive_crash(self):
         # Insert 14 (forces a split), delete 1..7, then crash before flush.
-        self.crash(self._inserts(1, 15) + [f"delete {i}" for i in range(1, 8)])
+        self.crash(self._inserts(1, 15) + [dele(i) for i in range(1, 8)])
         self.assertEqual(self.reopen_ids(), list(range(8, 15)))
 
     def test_recovery_is_idempotent_across_reopens(self):
-        self.crash(["insert 1 a a@x.com", "insert 2 b b@x.com",
-                    "insert 3 c c@x.com"])
+        self.crash([ins(1, "a", "a@x.com"), ins(2, "b", "b@x.com"),
+                    ins(3, "c", "c@x.com")])
         # Recovery runs on every open and the WAL is never truncated, so
         # replaying it repeatedly must keep producing the same state.
         self.assertEqual(self.reopen_ids(), [1, 2, 3])
         self.assertEqual(self.reopen_ids(), [1, 2, 3])
 
     def test_garbage_tail_in_wal_is_ignored(self):
-        self.crash(["insert 1 a a@x.com", "insert 2 b b@x.com"])
+        self.crash([ins(1, "a", "a@x.com"), ins(2, "b", "b@x.com")])
         # Append bytes that cannot parse as a valid record (bad type/length).
         with open(self.wal_path(), "ab") as f:
             f.write(b"\xff" * 100)
@@ -900,7 +995,7 @@ class TestWALRecovery(DBTestCase):
         self.assertEqual(self.reopen_ids(), [1, 2])
 
     def test_corrupted_payload_detected_by_checksum(self):
-        self.crash(["insert 1 a a@x.com", "insert 2 b b@x.com"])
+        self.crash([ins(1, "a", "a@x.com"), ins(2, "b", "b@x.com")])
         size = os.path.getsize(self.wal_path())
         # Flip a byte deep inside the SECOND record's page payload (100 bytes
         # from EOF lands well inside it; the trailing commit record is ~25B).
@@ -914,7 +1009,7 @@ class TestWALRecovery(DBTestCase):
         self.assertEqual(self.reopen_ids(), [1])
 
     def test_torn_commit_record_discards_its_transaction(self):
-        self.crash(["insert 1 a a@x.com", "insert 2 b b@x.com"])
+        self.crash([ins(1, "a", "a@x.com"), ins(2, "b", "b@x.com")])
         size = os.path.getsize(self.wal_path())
         # Chop the tail so the final COMMIT record is incomplete. Its
         # transaction's page-change is buffered but never committed -> dropped.
