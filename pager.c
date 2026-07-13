@@ -171,14 +171,25 @@ void load_catalog(Database *database, Pager *pager) {
   database->tables[0] = catalog_table;
 }
 
+Table *new_table_from_stmt(Pager *pgr, Statement *stmt) {
+  Table *table = malloc(sizeof(Table));
+  table->pager = pgr;
+  table->schema = malloc(sizeof(Schema));
+  memcpy(table->schema, &(stmt->schema), sizeof(Schema));
+  table->table_name = strdup(stmt->create_t_name);
+  table->root_page_num = pgr->num_pages;
+  table->rowid_counter = get_rightmost_rowid(table) + 1;
+  return table;
+}
+
 /* Opens the database file and ensures the root page is initialized. */
 Database *open_db(char *filename) {
   Pager *pager = new_pager(filename); /* Global pager */
 
   wal_recover(pager);
 
-  Database *database = (Database *)malloc(sizeof(Database));
-  load_catalog(database, pager);
+  Database *db = (Database *)malloc(sizeof(Database));
+  load_catalog(db, pager);
 
   if (pager->num_pages == 0) {
     void *catalog_node = get_page(pager, 0);
@@ -191,28 +202,20 @@ Database *open_db(char *filename) {
     uint32_t num_cells = *leaf_node_num_cells(catalog_node);
     uint32_t node_keys[num_cells];
     Record node_records[num_cells];
-    Schema *schema = database->tables[0]->schema;
+    Schema *schema = db->tables[0]->schema;
     leaf_node_read_all_cells(catalog_node, node_keys, node_records, schema);
-
+    
     for (int i = 0; i < num_cells; i++) {
-      database->num_tables++;
-      database->tables[i + 1] = malloc(sizeof(Table));
-      Statement statement;
+      Statement stmt;
       Token *tokens = lexer(node_records[i].values[2].text_val.str);
-      parse_statement(tokens, &statement);
-      database->tables[i + 1]->pager = pager;
-      database->tables[i + 1]->schema = malloc(sizeof(Schema));
-      memcpy(database->tables[i + 1]->schema, &(statement.schema),
-             sizeof(Schema));
-      database->tables[i + 1]->table_name =
-          strndup(node_records[i].values[1].text_val.str,
-                  node_records[i].values[1].text_val.len);
-      database->tables[i + 1]->root_page_num =
-          node_records[i].values[3].int_val;
-      database->tables[i + 1]->rowid_counter =
-          get_rightmost_rowid(database->tables[i + 1]);
+      parse_statement(tokens, &stmt);
+      db->tables[i + 1] = new_table_from_stmt(pager, &stmt);
+      db->tables[i + 1]->root_page_num = node_records[i].values[3].int_val;
+      db->num_tables++;
+
+      Table *t = db->tables[i + 1];
     }
   }
 
-  return database;
+  return db;
 }

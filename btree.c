@@ -172,7 +172,7 @@ uint32_t get_rightmost_rowid(Table *table) {
 
   uint32_t num_cells = *leaf_node_num_cells(node);
   if (num_cells == 0)
-    return 0;
+    return 1;
   return leaf_node_key_at_slot(node, num_cells - 1);
 }
 
@@ -571,7 +571,7 @@ uint32_t leaf_node_cell_size(Record *record) {
  */
 void leaf_node_insert(Cursor *cursor, uint32_t key, Record *record) {
   void *node = get_page(cursor->table->pager, cursor->page_num);
-
+  
   uint32_t free_start = *leaf_node_free_start(node);
   uint32_t free_end = *leaf_node_free_end(node);
   uint32_t cell_size = leaf_node_cell_size(record);

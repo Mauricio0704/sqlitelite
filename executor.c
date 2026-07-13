@@ -188,19 +188,11 @@ void execute_delete(Statement *statement, Table *table) {
   free(cursor);
 }
 
-void execute_create(Statement *statement, Table *table) {
-  table->schema = malloc(sizeof(Schema));
-  memcpy(table->schema, &statement->schema, sizeof(Schema));
-
-  void *catalog_node = get_page(table->pager, 0);
-
-  uint32_t num_tables = *leaf_node_num_cells(catalog_node);
-  if (num_tables >= MAX_TABLES)
-    return;
-
+Record get_new_table_record(Statement *statement, uint32_t root_page_num) {
   Record record;
   record.num_values = 4;
   record.values = malloc(sizeof(Value) * 4);
+
   record.values[0] = (Value){INT, TABLE};
   record.values[1].type = TEXT;
   record.values[1].text_val.len = strlen(statement->create_t_name);
@@ -215,54 +207,50 @@ void execute_create(Statement *statement, Table *table) {
     record.values[2].text_val.str = NULL;
     record.values[2].text_val.len = 0;
   }
-  uint32_t rowid_cat = get_rightmost_rowid(table) + 1;
-  record.values[3] = (Value){INT, rowid_cat};
-  statement->record_to_insert = record;
+  record.values[3] = (Value){INT, root_page_num};
+  return record;
+}
+
+void execute_create(Statement *statement, Table *table) {
+  void *catalog_node = get_page(table->pager, 0);
+  uint32_t num_tables = *leaf_node_num_cells(catalog_node);
+  if (num_tables >= MAX_TABLES)
+    return;
+
+  uint32_t n_table_root_page_num = table->pager->num_pages;
+  statement->record_to_insert =
+      get_new_table_record(statement, n_table_root_page_num);
   execute_insert(statement, table);
 
-  void *new_table_node = get_page(table->pager, rowid_cat);
+  void *new_table_node = get_page(table->pager, n_table_root_page_num);
   initialize_leaf_node(new_table_node);
   *node_is_root_value(new_table_node) = 1;
-
-  table->pager->num_pages++;
 }
 
 /* Dispatches a prepared statement to its corresponding executor. */
-ExecuteStatus execute_statement(Statement *statement, Database *database) {
+ExecuteStatus execute_statement(Statement *stmt, Database *db) {
   Table *table = malloc(sizeof(Table));
-  for (int i = 0; i < database->num_tables; i++) {
-    if (strcmp(database->tables[i]->table_name, statement->table_name) == 0)
-      table = database->tables[i];
+  for (int i = 0; i < db->num_tables; i++) {
+    if (strcmp(db->tables[i]->table_name, stmt->table_name) == 0)
+      table = db->tables[i];
   }
-  if (table == NULL) {
-    printf("Table not found");
-    return EXECUTE_SUCCESS;
-  }
-  switch (statement->statement_type) {
+  switch (stmt->statement_type) {
   case STATEMENT_INSERT:
-    return execute_insert(statement, table);
+    return execute_insert(stmt, table);
   case STATEMENT_SELECT:
-    execute_select(statement, table);
+    execute_select(stmt, table);
     break;
   case STATEMENT_DELETE:
-    execute_delete(statement, table);
+    execute_delete(stmt, table);
     break;
   case STATEMENT_CREATE:
-    execute_create(statement, table);
-    database->num_tables++;
-    database->tables[database->num_tables] = malloc(sizeof(Table));
-    database->tables[database->num_tables]->pager = table->pager;
-    database->tables[database->num_tables]->schema = malloc(sizeof(Schema));
-    memcpy(database->tables[database->num_tables]->schema, &(statement->schema),
-           sizeof(Schema));
-    database->tables[database->num_tables]->table_name =
-        strdup(statement->create_t_name);
-    database->tables[database->num_tables]->root_page_num =
-        table->pager->num_pages;
-    database->tables[database->num_tables]->rowid_counter =
-        get_rightmost_rowid(database->tables[database->num_tables]);
+    execute_create(stmt, table); /* Adds new record to catalog table */
+    Pager *pager = table->pager;
+
+    db->tables[db->num_tables] = new_table_from_stmt(pager, stmt);
+    pager->num_pages++;
+    db->num_tables++;
     break;
   }
-
   return EXECUTE_SUCCESS;
 }
