@@ -115,6 +115,14 @@ int main(int argc, char *argv[]) {
     case EXECUTE_DUPLICATE_KEY:
       printf("Error: Duplicate key.\n");
       break;
+
+    case EXECUTE_SCHEMA_MISMATCH:
+      printf("Error: Column types do not match with schema types\n");
+      break;
+
+    case EXECUTE_TABLE_NOT_FOUND:
+      printf("Error: Table not found\n");
+      break;
     }
   }
 }

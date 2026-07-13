@@ -139,26 +139,26 @@ PrepareStatus parse_create(Token *toks, const char *raw, Statement *stmt) {
   stmt->create_stmt->raw_stmt = raw;
   stmt->create_stmt->new_table_name =
       strndup(toks[2].start_lexeme, toks[2].len_lexeme);
-  Schema *curr_schema = &stmt->create_stmt->schema;
-  curr_schema->col_names = malloc(sizeof(char *) * 8); /* up to 8 cols */
-  curr_schema->col_types = malloc(sizeof(ColumnType) * 8);
-  curr_schema->n_cols = 0;
-  curr_schema->pk_idx = UINT32_MAX;
+  Schema *schema = &stmt->create_stmt->schema;
+  schema->col_names = malloc(sizeof(char *) * 8); /* up to 8 cols */
+  schema->col_types = malloc(sizeof(ColumnType) * 8);
+  schema->n_cols = 0;
+  schema->pk_idx = UINT32_MAX;
 
   size_t pos = 4;
   while (1) {
     if (toks[pos].type != TOKEN_IDENTIFIER)
       return PREPARE_FAILURE;
 
-    curr_schema->col_names[curr_schema->n_cols] =
+    schema->col_names[schema->n_cols] =
         strndup(toks[pos].start_lexeme, toks[pos].len_lexeme);
     pos++;
     switch (toks[pos].type) {
     case TOKEN_KW_INT:
-      curr_schema->col_types[curr_schema->n_cols] = INT;
+      schema->col_types[schema->n_cols] = INT;
       break;
     case TOKEN_KW_TEXT:
-      curr_schema->col_types[curr_schema->n_cols] = TEXT;
+      schema->col_types[schema->n_cols] = TEXT;
       break;
     default:
       return PREPARE_FAILURE;
@@ -167,10 +167,10 @@ PrepareStatus parse_create(Token *toks, const char *raw, Statement *stmt) {
     pos++;
     if (toks[pos].type == TOKEN_KW_PRIMARY &&
         toks[pos + 1].type == TOKEN_KW_KEY) {
-      curr_schema->pk_idx = curr_schema->n_cols;
+      schema->pk_idx = schema->n_cols;
       pos += 2;
     }
-    curr_schema->n_cols += 1;
+    schema->n_cols += 1;
     if (toks[pos].type == TOKEN_KW_RPAREN)
       break;
     if (toks[pos].type != TOKEN_COMMA)

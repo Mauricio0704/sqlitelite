@@ -49,7 +49,12 @@ typedef enum {
   PREPARE_UNRECOGNIZED_COMMAND
 } PrepareStatus;
 
-typedef enum { EXECUTE_SUCCESS, EXECUTE_DUPLICATE_KEY } ExecuteStatus;
+typedef enum {
+  EXECUTE_SUCCESS,
+  EXECUTE_DUPLICATE_KEY,
+  EXECUTE_SCHEMA_MISMATCH,
+  EXECUTE_TABLE_NOT_FOUND
+} ExecuteStatus;
 
 typedef enum {
   META_COMMAND_SUCCESS,

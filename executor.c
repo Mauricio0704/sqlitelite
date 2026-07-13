@@ -1,4 +1,5 @@
 #include "executor.h"
+#include "analyzer.h"
 #include "btree.h"
 #include "common.h"
 #include "pager.h"
@@ -229,11 +230,10 @@ void execute_create(CreateStmt *stmt, Table *table) {
 
 /* Dispatches a prepared statement to its corresponding executor. */
 ExecuteStatus execute_statement(Statement *stmt, Database *db) {
-  Table *table = malloc(sizeof(Table));
-  for (int i = 0; i < db->num_tables; i++) {
-    if (strcmp(db->tables[i]->table_name, stmt->table_name) == 0)
-      table = db->tables[i];
-  }
+  Table *table;
+  ExecuteStatus status = analyze(stmt, db, &table);
+  if (status != EXECUTE_SUCCESS)
+    return status;
   switch (stmt->type) {
   case STATEMENT_INSERT:
     return execute_insert(stmt->insert_stmt, table);
