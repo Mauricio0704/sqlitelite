@@ -87,8 +87,8 @@ void close_db(Table *table) {
   close(pager->fd);
   free(pager);
 
-  free(table->schema->column_types);
-  free(table->schema->column_names);
+  free(table->schema->col_types);
+  free(table->schema->col_names);
   free(table->schema);
   free(table);
 }
@@ -127,38 +127,38 @@ void *get_page(Pager *pager, uint32_t page_num) {
 /* TEMPORARY  */
 static Schema *build_users_schema(void) {
   Schema *schema = malloc(sizeof(Schema));
-  schema->num_columns = 3;
-  schema->pk_column = 0;
+  schema->n_cols = 3;
+  schema->pk_idx = 0;
 
-  schema->column_types = malloc(sizeof(ColumnType) * schema->num_columns);
-  schema->column_types[0] = INT;
-  schema->column_types[1] = TEXT;
-  schema->column_types[2] = TEXT;
+  schema->col_types = malloc(sizeof(ColumnType) * schema->n_cols);
+  schema->col_types[0] = INT;
+  schema->col_types[1] = TEXT;
+  schema->col_types[2] = TEXT;
 
-  schema->column_names = malloc(sizeof(char *) * schema->num_columns);
-  schema->column_names[0] = "id";
-  schema->column_names[1] = "name";
-  schema->column_names[2] = "email";
+  schema->col_names = malloc(sizeof(char *) * schema->n_cols);
+  schema->col_names[0] = "id";
+  schema->col_names[1] = "name";
+  schema->col_names[2] = "email";
 
   return schema;
 }
 
 void load_catalog(Database *database, Pager *pager) {
   Schema *schema = malloc(sizeof(Schema));
-  schema->num_columns = 4;
-  schema->pk_column = UINT32_MAX;
+  schema->n_cols = 4;
+  schema->pk_idx = UINT32_MAX;
 
-  schema->column_types = malloc(sizeof(ColumnType) * schema->num_columns);
-  schema->column_types[0] = INT;
-  schema->column_types[1] = TEXT;
-  schema->column_types[2] = TEXT;
-  schema->column_types[3] = INT;
+  schema->col_types = malloc(sizeof(ColumnType) * schema->n_cols);
+  schema->col_types[0] = INT;
+  schema->col_types[1] = TEXT;
+  schema->col_types[2] = TEXT;
+  schema->col_types[3] = INT;
 
-  schema->column_names = malloc(sizeof(char *) * schema->num_columns);
-  schema->column_names[0] = "type";
-  schema->column_names[1] = "name";
-  schema->column_names[2] = "create_statement";
-  schema->column_names[3] = "root_page_num";
+  schema->col_names = malloc(sizeof(char *) * schema->n_cols);
+  schema->col_names[0] = "type";
+  schema->col_names[1] = "name";
+  schema->col_names[2] = "create_statement";
+  schema->col_names[3] = "root_page_num";
 
   database->num_tables = 1;
   Table *catalog_table = malloc(sizeof(Table));
@@ -175,8 +175,8 @@ Table *new_table_from_stmt(Pager *pgr, Statement *stmt) {
   Table *table = malloc(sizeof(Table));
   table->pager = pgr;
   table->schema = malloc(sizeof(Schema));
-  memcpy(table->schema, &(stmt->schema), sizeof(Schema));
-  table->table_name = strdup(stmt->create_t_name);
+  memcpy(table->schema, &(stmt->create_stmt->schema), sizeof(Schema));
+  table->table_name = strdup(stmt->create_stmt->new_table_name);
   table->root_page_num = pgr->num_pages;
   table->rowid_counter = get_rightmost_rowid(table) + 1;
   return table;
@@ -207,13 +207,13 @@ Database *open_db(char *filename) {
     
     for (int i = 0; i < num_cells; i++) {
       Statement stmt;
-      Token *tokens = lexer(node_records[i].values[2].text_val.str);
-      parse_statement(tokens, &stmt);
+      const char *raw = node_records[i].values[2].text_val.str;
+      Token *tokens = lexer(raw);
+      parse_statement(tokens, raw, &stmt);
       db->tables[i + 1] = new_table_from_stmt(pager, &stmt);
       db->tables[i + 1]->root_page_num = node_records[i].values[3].int_val;
       db->num_tables++;
-
-      Table *t = db->tables[i + 1];
+      db->tables[i + 1]->rowid_counter = get_rightmost_rowid(db->tables[i + 1]) + 1;
     }
   }
 

@@ -128,177 +128,183 @@ Expr *parse_or(Token *tokens, uint32_t *pos) {
 
 Expr *parse_expr(Token *tokens, uint32_t *pos) { return parse_or(tokens, pos); }
 
-PrepareStatus parse_statement(Token *tokens, Statement *statement) {
-  switch (tokens[0].type) {
-  case TOKEN_KW_CREATE: {
-    statement->statement_type = STATEMENT_CREATE;
-    statement->table_name = strndup("catalog", 7);
-    if (tokens[1].type != TOKEN_KW_TABLE)
+PrepareStatus parse_create(Token *toks, const char *raw, Statement *stmt) {
+  if (toks[1].type != TOKEN_KW_TABLE || toks[2].type != TOKEN_IDENTIFIER ||
+      toks[3].type != TOKEN_KW_LPAREN)
+    return PREPARE_FAILURE;
+  stmt->type = STATEMENT_CREATE;
+  stmt->table_name = strdup("catalog");
+
+  stmt->create_stmt = malloc(sizeof(CreateStmt));
+  stmt->create_stmt->raw_stmt = raw;
+  stmt->create_stmt->new_table_name =
+      strndup(toks[2].start_lexeme, toks[2].len_lexeme);
+  Schema *curr_schema = &stmt->create_stmt->schema;
+  curr_schema->col_names = malloc(sizeof(char *) * 8); /* up to 8 cols */
+  curr_schema->col_types = malloc(sizeof(ColumnType) * 8);
+  curr_schema->n_cols = 0;
+  curr_schema->pk_idx = UINT32_MAX;
+
+  size_t pos = 4;
+  while (1) {
+    if (toks[pos].type != TOKEN_IDENTIFIER)
       return PREPARE_FAILURE;
-    if (tokens[2].type != TOKEN_IDENTIFIER)
+
+    curr_schema->col_names[curr_schema->n_cols] =
+        strndup(toks[pos].start_lexeme, toks[pos].len_lexeme);
+    pos++;
+    switch (toks[pos].type) {
+    case TOKEN_KW_INT:
+      curr_schema->col_types[curr_schema->n_cols] = INT;
+      break;
+    case TOKEN_KW_TEXT:
+      curr_schema->col_types[curr_schema->n_cols] = TEXT;
+      break;
+    default:
       return PREPARE_FAILURE;
-    if (tokens[3].type != TOKEN_KW_LPAREN)
-      return PREPARE_FAILURE;
-
-    statement->create_t_name =
-        strndup(tokens[2].start_lexeme, tokens[2].len_lexeme);
-    Schema *curr_schema = &statement->schema;
-    curr_schema->column_names = malloc(sizeof(char *) * 8); /* up to 8 cols */
-    curr_schema->column_types = malloc(sizeof(ColumnType) * 8);
-    curr_schema->num_columns = 0;
-    curr_schema->pk_column = UINT32_MAX;
-
-    size_t pos = 4;
-    while (1) {
-      if (tokens[pos].type != TOKEN_IDENTIFIER)
-        return PREPARE_FAILURE;
-
-      curr_schema->column_names[curr_schema->num_columns] =
-          malloc(sizeof(char) * tokens[pos].len_lexeme + 1);
-      memcpy(curr_schema->column_names[curr_schema->num_columns],
-             tokens[pos].start_lexeme, tokens[pos].len_lexeme);
-      curr_schema
-          ->column_names[curr_schema->num_columns][tokens[pos].len_lexeme] =
-          '\0';
-      pos++;
-      switch (tokens[pos].type) {
-      case TOKEN_KW_INT:
-        curr_schema->column_types[curr_schema->num_columns] = INT;
-        break;
-      case TOKEN_KW_TEXT:
-        curr_schema->column_types[curr_schema->num_columns] = TEXT;
-        break;
-      default:
-        return PREPARE_FAILURE;
-      }
-
-      pos++;
-      if (tokens[pos].type == TOKEN_KW_PRIMARY &&
-          tokens[pos + 1].type == TOKEN_KW_KEY) {
-        curr_schema->pk_column = curr_schema->num_columns;
-        pos += 2;
-      }
-      curr_schema->num_columns += 1;
-      // pos++;
-      if (tokens[pos].type == TOKEN_KW_RPAREN)
-        break;
-      if (tokens[pos].type != TOKEN_COMMA)
-        return PREPARE_FAILURE;
-      pos++;
     }
-    if (tokens[++pos].type != TOKEN_EOF)
+
+    pos++;
+    if (toks[pos].type == TOKEN_KW_PRIMARY &&
+        toks[pos + 1].type == TOKEN_KW_KEY) {
+      curr_schema->pk_idx = curr_schema->n_cols;
+      pos += 2;
+    }
+    curr_schema->n_cols += 1;
+    if (toks[pos].type == TOKEN_KW_RPAREN)
+      break;
+    if (toks[pos].type != TOKEN_COMMA)
       return PREPARE_FAILURE;
+    pos++;
+  }
+  if (toks[++pos].type != TOKEN_EOF)
+    return PREPARE_FAILURE;
+
+  return PREPARE_SUCCESS;
+}
+
+PrepareStatus parse_select(Token *toks, Statement *stmt) {
+  stmt->type = STATEMENT_SELECT;
+  stmt->select_stmt = malloc(sizeof(SelectStmt));
+  stmt->select_stmt->projection_count = 0;
+  stmt->select_stmt->has_where = 0;
+
+  size_t pos;
+  if (toks[1].type == TOKEN_OP_ALL) {
+    /* SELECT * : projection_count 0 means "all columns". */
+    pos = 2;
+  } else {
+    /* Parse a comma-separated list of column identifiers. */
+    pos = 1;
+    while (1) {
+      if (toks[pos].type != TOKEN_IDENTIFIER ||
+          stmt->select_stmt->projection_count >= MAX_SELECT_COLUMNS)
+        return PREPARE_FAILURE;
+
+      int col_idx;
+      if (!resolve_column(toks[pos], &col_idx))
+        return PREPARE_FAILURE;
+      stmt->select_stmt->projection[stmt->select_stmt->projection_count++] =
+          col_idx;
+      pos++;
+
+      if (toks[pos].type != TOKEN_COMMA)
+        break;
+      pos++; /* consume comma; another column must follow */
+    }
+  }
+
+  if (toks[pos].type != TOKEN_KW_FROM || toks[pos + 1].type != TOKEN_IDENTIFIER)
+    return PREPARE_FAILURE;
+  stmt->table_name =
+      strndup(toks[pos + 1].start_lexeme, toks[pos + 1].len_lexeme);
+  pos += 2;
+
+  if (toks[pos].type == TOKEN_EOF)
+    return PREPARE_SUCCESS;
+  if (toks[pos].type == TOKEN_KW_WHERE) {
+    uint32_t wpos = pos + 1; /* first token after WHERE */
+    Expr *where_expr = parse_expr(toks, &wpos);
+    if (where_expr == NULL || toks[wpos].type != TOKEN_EOF) {
+      free_expr(where_expr);
+      return PREPARE_FAILURE;
+    }
+    stmt->select_stmt->has_where = 1;
+    stmt->select_stmt->where_expr = where_expr;
     return PREPARE_SUCCESS;
   }
-  case TOKEN_KW_SELECT: {
-    statement->statement_type = STATEMENT_SELECT;
-    statement->projection_count = 0;
-    statement->has_where = 0;
+  return PREPARE_FAILURE;
+}
 
-    size_t pos;
-    if (tokens[1].type == TOKEN_OP_ALL) {
-      /* SELECT * : projection_count 0 means "all columns". */
-      pos = 2;
-    } else {
-      /* Parse a comma-separated list of column identifiers. */
-      pos = 1;
-      while (1) {
-        if (tokens[pos].type != TOKEN_IDENTIFIER ||
-            statement->projection_count >= MAX_SELECT_COLUMNS)
-          return PREPARE_FAILURE;
+PrepareStatus parse_insert(Token *toks, Statement *stmt) {
+  stmt->type = STATEMENT_INSERT;
+  if (toks[1].type != TOKEN_KW_INTO || toks[2].type != TOKEN_IDENTIFIER)
+    return PREPARE_FAILURE;
 
-        int col_idx;
-        if (!resolve_column(tokens[pos], &col_idx))
-          return PREPARE_FAILURE;
-        statement->projection[statement->projection_count++] = col_idx;
-        pos++;
+  stmt->table_name = malloc(toks[2].len_lexeme + 1);
+  memcpy(stmt->table_name, toks[2].start_lexeme, toks[2].len_lexeme);
+  stmt->table_name[toks[2].len_lexeme] = '\0';
 
-        if (tokens[pos].type != TOKEN_COMMA)
-          break;
-        pos++; /* consume comma; another column must follow */
-      }
+  stmt->insert_stmt = malloc(sizeof(InsertStmt));
+
+  Record *record = &stmt->insert_stmt->record;
+  record->num_values = 0;
+  record->values = malloc(sizeof(Value) * 8); /* Placeholder */
+
+  uint16_t token_idx = 3;
+  while (toks[token_idx].type != TOKEN_EOF) {
+    Token curr_token = toks[token_idx];
+    switch (curr_token.type) {
+    case TOKEN_INT_LITERAL:
+      record->values[record->num_values].type = INT;
+      record->values[record->num_values].int_val =
+          (uint32_t)strtol(curr_token.start_lexeme, NULL, 10);
+      record->num_values += 1;
+      break;
+    case TOKEN_IDENTIFIER: {
+      Value *curr_value = &(record->values[record->num_values]);
+      curr_value->type = TEXT;
+      curr_value->text_val.len = curr_token.len_lexeme;
+      curr_value->text_val.str = malloc(curr_value->text_val.len + 1);
+      memcpy(curr_value->text_val.str, curr_token.start_lexeme,
+             curr_token.len_lexeme);
+      curr_value->text_val.str[curr_token.len_lexeme] = '\0';
+      record->num_values += 1;
+      break;
     }
-
-    if (tokens[pos].type != TOKEN_KW_FROM ||
-        tokens[pos + 1].type != TOKEN_IDENTIFIER)
+    default:
       return PREPARE_FAILURE;
-    statement->table_name =
-        strndup(tokens[pos + 1].start_lexeme, tokens[pos + 1].len_lexeme);
-    pos += 2;
-
-    if (tokens[pos].type == TOKEN_EOF)
-      return PREPARE_SUCCESS;
-    if (tokens[pos].type == TOKEN_KW_WHERE) {
-      uint32_t wpos = pos + 1; /* first token after WHERE */
-      Expr *where_expr = parse_expr(tokens, &wpos);
-      if (where_expr == NULL || tokens[wpos].type != TOKEN_EOF) {
-        free_expr(where_expr);
-        return PREPARE_FAILURE;
-      }
-      statement->has_where = 1;
-      statement->where_expr = where_expr;
-      return PREPARE_SUCCESS;
     }
+    token_idx += 1;
+  }
+
+  return PREPARE_SUCCESS;
+}
+
+PrepareStatus parse_delete(Token *toks, Statement *stmt) {
+  stmt->type = STATEMENT_DELETE;
+  if (toks[1].type != TOKEN_KW_FROM || toks[2].type != TOKEN_IDENTIFIER ||
+      toks[3].type != TOKEN_INT_LITERAL || toks[4].type != TOKEN_EOF) {
+    printf("Incorrect arguments for delete\n");
     return PREPARE_FAILURE;
   }
+  stmt->delete_stmt = malloc(sizeof(DeleteStmt));
+  stmt->table_name = strndup(toks[2].start_lexeme, toks[2].len_lexeme);
+  stmt->delete_stmt->id_to_delete =
+      (uint32_t)strtol(toks[3].start_lexeme, NULL, 10);
+  return PREPARE_SUCCESS;
+}
 
-  case TOKEN_KW_INSERT: {
-    if (tokens[1].type != TOKEN_KW_INTO || tokens[2].type != TOKEN_IDENTIFIER) {
-      printf("Table to insert is not specified\n");
-      return PREPARE_FAILURE;
-    }
-    statement->table_name = malloc(tokens[2].len_lexeme + 1);
-    memcpy(statement->table_name, tokens[2].start_lexeme, tokens[2].len_lexeme);
-    statement->table_name[tokens[2].len_lexeme] = '\0';
-
-    Record *record = &statement->record_to_insert;
-    record->num_values = 0;
-    record->values = malloc(sizeof(Value) * 8); /* Placeholder */
-    statement->statement_type = STATEMENT_INSERT;
-
-    uint16_t token_idx = 3;
-    while (tokens[token_idx].type != TOKEN_EOF) {
-      Token curr_token = tokens[token_idx];
-      switch (curr_token.type) {
-      case TOKEN_INT_LITERAL:
-        record->values[record->num_values].type = INT;
-        record->values[record->num_values].int_val =
-            (uint32_t)strtol(curr_token.start_lexeme, NULL, 10);
-        record->num_values += 1;
-        break;
-      case TOKEN_IDENTIFIER: {
-        Value *curr_value = &(record->values[record->num_values]);
-        curr_value->type = TEXT;
-        curr_value->text_val.len = curr_token.len_lexeme;
-        curr_value->text_val.str = malloc(curr_value->text_val.len + 1);
-        memcpy(curr_value->text_val.str, curr_token.start_lexeme,
-               curr_token.len_lexeme);
-        curr_value->text_val.str[curr_token.len_lexeme] = '\0';
-        record->num_values += 1;
-        break;
-      }
-      default:
-        break;
-      }
-      token_idx += 1;
-    }
-
-    return PREPARE_SUCCESS;
-  }
-
+PrepareStatus parse_statement(Token *toks, const char *raw, Statement *stmt) {
+  switch (toks[0].type) {
+  case TOKEN_KW_CREATE:
+    return parse_create(toks, raw, stmt);
+  case TOKEN_KW_SELECT:
+    return parse_select(toks, stmt);
+  case TOKEN_KW_INSERT:
+    return parse_insert(toks, stmt);
   case TOKEN_KW_DELETE:
-    if (tokens[1].type != TOKEN_KW_FROM || tokens[2].type != TOKEN_IDENTIFIER ||
-        tokens[3].type != TOKEN_INT_LITERAL || tokens[4].type != TOKEN_EOF) {
-      printf("Incorrect arguments for delete\n");
-      return PREPARE_FAILURE;
-    }
-    statement->statement_type = STATEMENT_DELETE;
-    statement->table_name =
-        strndup(tokens[2].start_lexeme, tokens[2].len_lexeme);
-    statement->id_to_delete =
-        (uint32_t)strtol(tokens[3].start_lexeme, NULL, 10);
-    return PREPARE_SUCCESS;
-
+    return parse_delete(toks, stmt);
   default:
     return PREPARE_UNRECOGNIZED_COMMAND;
   }
@@ -306,20 +312,17 @@ PrepareStatus parse_statement(Token *tokens, Statement *statement) {
 
 void debug_lexer(Token *tokens) {
   int i = 0;
-  while (tokens[i].type != TOKEN_EOF) {
+  while (tokens[i++].type != TOKEN_EOF) {
     printf("[%s] ", token_type_names[tokens[i].type]);
-    i += 1;
   }
   printf("\n");
 }
 
 /* Parses user input into an executable SQL-like statement structure. */
-PrepareStatus prepare_statement(const char *input_buffer,
-                                Statement *statement) {
-  Token *tokens = lexer(input_buffer);
-  statement->raw_create_stmt = input_buffer;
-  PrepareStatus status = parse_statement(tokens, statement);
+PrepareStatus prepare_statement(const char *input_buffer, Statement *stmt) {
+  Token *toks = lexer(input_buffer);
+  PrepareStatus status = parse_statement(toks, input_buffer, stmt);
 
-  free(tokens);
+  free(toks);
   return status;
 }

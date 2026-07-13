@@ -37,10 +37,10 @@ typedef struct {
 } CatalogEntry;
 
 typedef struct Schema {
-  ColumnType *column_types;
-  char **column_names;
-  size_t num_columns;
-  uint32_t pk_column;
+  ColumnType *col_types;
+  char **col_names;
+  size_t n_cols;
+  uint32_t pk_idx;
 } Schema;
 
 typedef enum {

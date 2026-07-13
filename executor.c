@@ -54,11 +54,11 @@ void print_row(Record record, const ColumnId *projection_idxs,
 
 /* Inserts a record into the B-tree, redistributing nodes and updating parent
  keys as needed.*/
-ExecuteStatus execute_insert(Statement *statement, Table *table) {
-  Record record = statement->record_to_insert;
+ExecuteStatus execute_insert(InsertStmt *stmt, Table *table) {
+  Record record = stmt->record;
 
   uint32_t key;
-  uint32_t pk_col = table->schema->pk_column;
+  uint32_t pk_col = table->schema->pk_idx;
 
   /* If PK is not defined or it is TEXT, should use rowid */
   if (pk_col == UINT32_MAX || record.values[pk_col].type == TEXT)
@@ -129,7 +129,7 @@ uint8_t row_matches(Expr *where_expr, Record record) {
   return 0;
 }
 
-void execute_select(Statement *statement, Table *table) {
+void execute_select(SelectStmt *stmt, Table *table) {
   Cursor *cursor = new_cursor_start(table);
 
   void *node = get_page(table->pager, cursor->page_num);
@@ -143,18 +143,18 @@ void execute_select(Statement *statement, Table *table) {
   while (!(cursor->is_end_of_table)) {
     Record record;
     read_deserialized_record(get_record_start(cursor), &record, table->schema);
-    if (!statement->has_where || row_matches(statement->where_expr, record))
-      print_row(record, statement->projection, statement->projection_count);
+    if (!stmt->has_where || row_matches(stmt->where_expr, record))
+      print_row(record, stmt->projection, stmt->projection_count);
     advance_cursor(cursor);
   }
 
-  if (statement->has_where)
-    free_expr(statement->where_expr);
+  if (stmt->has_where)
+    free_expr(stmt->where_expr);
   free(cursor);
 }
 
-void execute_delete(Statement *statement, Table *table) {
-  uint32_t key = statement->id_to_delete;
+void execute_delete(DeleteStmt *stmt, Table *table) {
+  uint32_t key = stmt->id_to_delete;
 
   int key_exists;
   Cursor *cursor = find_key_cursor(table, key, &key_exists);
@@ -188,19 +188,19 @@ void execute_delete(Statement *statement, Table *table) {
   free(cursor);
 }
 
-Record get_new_table_record(Statement *statement, uint32_t root_page_num) {
+Record get_new_table_record(CreateStmt *stmt, uint32_t root_page_num) {
   Record record;
   record.num_values = 4;
   record.values = malloc(sizeof(Value) * 4);
 
   record.values[0] = (Value){INT, TABLE};
   record.values[1].type = TEXT;
-  record.values[1].text_val.len = strlen(statement->create_t_name);
+  record.values[1].text_val.len = strlen(stmt->new_table_name);
   record.values[1].text_val.str =
-      strndup(statement->create_t_name, record.values[1].text_val.len);
+      strndup(stmt->new_table_name, record.values[1].text_val.len);
   record.values[2].type = TEXT;
-  if (statement->raw_create_stmt != NULL) {
-    record.values[2].text_val.str = strdup(statement->raw_create_stmt);
+  if (stmt->raw_stmt != NULL) {
+    record.values[2].text_val.str = strdup(stmt->raw_stmt);
     record.values[2].text_val.len =
         (uint32_t)strlen(record.values[2].text_val.str);
   } else {
@@ -211,16 +211,16 @@ Record get_new_table_record(Statement *statement, uint32_t root_page_num) {
   return record;
 }
 
-void execute_create(Statement *statement, Table *table) {
+void execute_create(CreateStmt *stmt, Table *table) {
   void *catalog_node = get_page(table->pager, 0);
   uint32_t num_tables = *leaf_node_num_cells(catalog_node);
   if (num_tables >= MAX_TABLES)
     return;
 
   uint32_t n_table_root_page_num = table->pager->num_pages;
-  statement->record_to_insert =
-      get_new_table_record(statement, n_table_root_page_num);
-  execute_insert(statement, table);
+  InsertStmt ins_stmt;
+  ins_stmt.record = get_new_table_record(stmt, n_table_root_page_num);
+  execute_insert(&ins_stmt, table);
 
   void *new_table_node = get_page(table->pager, n_table_root_page_num);
   initialize_leaf_node(new_table_node);
@@ -234,17 +234,18 @@ ExecuteStatus execute_statement(Statement *stmt, Database *db) {
     if (strcmp(db->tables[i]->table_name, stmt->table_name) == 0)
       table = db->tables[i];
   }
-  switch (stmt->statement_type) {
+  switch (stmt->type) {
   case STATEMENT_INSERT:
-    return execute_insert(stmt, table);
+    return execute_insert(stmt->insert_stmt, table);
   case STATEMENT_SELECT:
-    execute_select(stmt, table);
+    execute_select(stmt->select_stmt, table);
     break;
   case STATEMENT_DELETE:
-    execute_delete(stmt, table);
+    execute_delete(stmt->delete_stmt, table);
     break;
   case STATEMENT_CREATE:
-    execute_create(stmt, table); /* Adds new record to catalog table */
+    execute_create(stmt->create_stmt,
+                   table); /* Adds new record to catalog table */
     Pager *pager = table->pager;
 
     db->tables[db->num_tables] = new_table_from_stmt(pager, stmt);

@@ -23,18 +23,35 @@ typedef struct Expr {
 } Expr;
 
 typedef struct {
-  StatementType statement_type;
-  Record record_to_insert;
+  Record record;
+} InsertStmt;
+
+typedef struct {
+  const char *raw_stmt;
+  char *new_table_name;
+  Schema schema;
+} CreateStmt;
+
+typedef struct {
   uint32_t id_to_delete;
-  /* Ordered projection list. A count of 0 means "all columns" (bare SELECT). */
+} DeleteStmt;
+
+typedef struct {
   ColumnId projection[MAX_SELECT_COLUMNS];
   size_t projection_count;
   int has_where;
   Expr *where_expr;
-  Schema schema;
-  char *table_name; /* Table where the operation is executed */
-  const char *raw_create_stmt; /* For CREATE TABLE, store the original statement */
-  char *create_t_name; /* For CREATE TABLE, store the table name */
+} SelectStmt;
+
+typedef struct {
+  StatementType type;
+  char *table_name;
+  union {
+    InsertStmt *insert_stmt;
+    CreateStmt *create_stmt;
+    DeleteStmt *delete_stmt;
+    SelectStmt *select_stmt;
+  };
 } Statement;
 
 int  resolve_column(Token token, int *out);
@@ -44,7 +61,7 @@ Expr *parse_and(Token *tokens, uint32_t *pos);
 Expr *parse_or(Token *tokens, uint32_t *pos);
 Expr *parse_expr(Token *tokens, uint32_t *pos);
 void free_expr(Expr *expr);                     // recursive teardown
-PrepareStatus parse_statement(Token *tokens, Statement *statement);
+PrepareStatus parse_statement(Token *tokens, const char *raw, Statement *statement);
 PrepareStatus prepare_statement(const char *in, Statement *statement);
 
 #endif /* PARSER_H */

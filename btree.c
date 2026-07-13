@@ -207,12 +207,12 @@ void write_serialized_record(Record *source, void *destination) {
 void read_deserialized_record(void *source, Record *destination,
                               Schema *schema) {
   uint32_t CURR_OFFSET = 0;
-  uint32_t num_columns = schema->num_columns;
+  uint32_t num_columns = schema->n_cols;
   destination->num_values = num_columns;
   destination->values = malloc(sizeof(Value) * destination->num_values);
 
   for (size_t i = 0; i < num_columns; i++) {
-    ColumnType curr_type = schema->column_types[i];
+    ColumnType curr_type = schema->col_types[i];
     Value *curr_value = &(destination->values[i]);
     switch (curr_type) {
     case INT:

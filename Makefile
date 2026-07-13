@@ -2,9 +2,9 @@ CC      := cc
 CFLAGS  := -Wall -Wextra -g
 BIN     := mini-db
 
-OBJS := main.o lexer.o parser.o pager.o wal.o btree.o executor.o
+OBJS := main.o lexer.o parser.o pager.o wal.o btree.o executor.o analyzer.o
 
-HEADERS := common.h lexer.h parser.h pager.h wal.h btree.h executor.h
+HEADERS := common.h lexer.h parser.h pager.h wal.h btree.h executor.h analyzer.h
 
 .PHONY: all test clean
 
