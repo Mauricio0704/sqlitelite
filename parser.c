@@ -13,23 +13,19 @@ void free_expr(Expr *expr) {
     return;
   free_expr(expr->left);
   free_expr(expr->right);
-  if (expr->kind == COMPARISON)
+  if (expr->kind == COMPARISON) {
     free(expr->strval);
+    free(expr->col_name);
+  }
   free(expr);
 }
 
-/* Maps a column-name identifier to its column_index. Returns 1 on success. */
-int resolve_column(Token token, int *out) {
-  if (token.len_lexeme == 2 && strncmp(token.start_lexeme, "id", 2) == 0)
-    *out = COLUMN_ID;
-  else if (token.len_lexeme == 4 && strncmp(token.start_lexeme, "name", 4) == 0)
-    *out = COLUMN_USERNAME;
-  else if (token.len_lexeme == 5 &&
-           strncmp(token.start_lexeme, "email", 5) == 0)
-    *out = COLUMN_EMAIL;
-  else
-    return 0;
-  return 1;
+void free_select_stmt(SelectStmt *stmt) {
+  for (size_t i = 0; i < stmt->projection_count; i++)
+    free(stmt->projection_names[i]);
+  if (stmt->has_where)
+    free_expr(stmt->where_expr);
+  free(stmt);
 }
 
 int is_value_token(TokenType type) {
@@ -37,9 +33,9 @@ int is_value_token(TokenType type) {
 }
 
 Expr *parse_comparison(Token *tokens, uint32_t *pos) {
-  int where_col;
-  if (!resolve_column(tokens[*pos], &where_col))
+  if (tokens[*pos].type != TOKEN_IDENTIFIER)
     return NULL;
+  Token col_tok = tokens[*pos];
   (*pos)++;
   TokenType op;
   if (tokens[*pos].type != TOKEN_OP_EQUAL &&
@@ -58,22 +54,12 @@ Expr *parse_comparison(Token *tokens, uint32_t *pos) {
   expr->left = NULL;
   expr->right = NULL;
   expr->strval = NULL;
-  expr->col_idx = where_col;
+  expr->col_name = strndup(col_tok.start_lexeme, col_tok.len_lexeme);
   expr->op_type = op;
 
   if (tokens[*pos].type == TOKEN_INT_LITERAL) {
-    /* Only the integer column may be compared against an int literal. */
-    if (where_col != COLUMN_ID) {
-      free_expr(expr);
-      return NULL;
-    }
     expr->intval = (uint32_t)strtol(tokens[*pos].start_lexeme, NULL, 10);
   } else {
-    /* String literals only match the string columns. */
-    if (where_col == COLUMN_ID) {
-      free_expr(expr);
-      return NULL;
-    }
     expr->strval = malloc(sizeof(char) * (tokens[*pos].len_lexeme + 1));
     memcpy(expr->strval, tokens[*pos].start_lexeme, tokens[*pos].len_lexeme);
     expr->strval[tokens[*pos].len_lexeme] = '\0';
@@ -99,6 +85,7 @@ Expr *parse_and(Token *tokens, uint32_t *pos) {
     node->left = left;
     node->right = right;
     node->strval = NULL;
+    node->col_name = NULL;
     left = node;
   }
 
@@ -120,6 +107,7 @@ Expr *parse_or(Token *tokens, uint32_t *pos) {
     node->left = left;
     node->right = right;
     node->strval = NULL;
+    node->col_name = NULL;
     left = node;
   }
 
@@ -201,11 +189,8 @@ PrepareStatus parse_select(Token *toks, Statement *stmt) {
           stmt->select_stmt->projection_count >= MAX_SELECT_COLUMNS)
         return PREPARE_FAILURE;
 
-      int col_idx;
-      if (!resolve_column(toks[pos], &col_idx))
-        return PREPARE_FAILURE;
-      stmt->select_stmt->projection[stmt->select_stmt->projection_count++] =
-          col_idx;
+      stmt->select_stmt->projection_names[stmt->select_stmt->projection_count++] =
+          strndup(toks[pos].start_lexeme, toks[pos].len_lexeme);
       pos++;
 
       if (toks[pos].type != TOKEN_COMMA)

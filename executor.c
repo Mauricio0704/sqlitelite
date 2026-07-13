@@ -11,8 +11,7 @@
 
 /* Reads and prints the record currently addressed by the cursor, emitting only
  * the projected columns in order. A count of 0 prints every column. */
-void print_row(Record record, const ColumnId *projection_idxs,
-               size_t projection_count) {
+void print_row(Record record, int *projection_idxs, size_t projection_count) {
   if (projection_count == 0) {
     printf("(");
     for (size_t i = 0; i < record.num_values; i++) {
@@ -145,12 +144,10 @@ void execute_select(SelectStmt *stmt, Table *table) {
     Record record;
     read_deserialized_record(get_record_start(cursor), &record, table->schema);
     if (!stmt->has_where || row_matches(stmt->where_expr, record))
-      print_row(record, stmt->projection, stmt->projection_count);
+      print_row(record, stmt->projection_idxs, stmt->projection_count);
     advance_cursor(cursor);
   }
 
-  if (stmt->has_where)
-    free_expr(stmt->where_expr);
   free(cursor);
 }
 
@@ -232,13 +229,18 @@ void execute_create(CreateStmt *stmt, Table *table) {
 ExecuteStatus execute_statement(Statement *stmt, Database *db) {
   Table *table;
   ExecuteStatus status = analyze(stmt, db, &table);
-  if (status != EXECUTE_SUCCESS)
+  if (status != EXECUTE_SUCCESS) {
+    if (stmt->type == STATEMENT_SELECT)
+      free_select_stmt(stmt->select_stmt);
     return status;
+  }
+
   switch (stmt->type) {
   case STATEMENT_INSERT:
     return execute_insert(stmt->insert_stmt, table);
   case STATEMENT_SELECT:
     execute_select(stmt->select_stmt, table);
+    free_select_stmt(stmt->select_stmt);
     break;
   case STATEMENT_DELETE:
     execute_delete(stmt->delete_stmt, table);
