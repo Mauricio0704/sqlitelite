@@ -52,6 +52,39 @@ def dele(id):
     return f"delete from users {id}"
 
 
+# --- generic, table-name-parameterized builders ----------------------------
+# The helpers above are hardwired to `users`; these take an explicit table so
+# the multi-table / arbitrary-schema suites can address any table.
+
+def make_users_like(table):
+    """A users-shaped schema under an arbitrary table name. Reuses the
+    id/name/email columns so projection and WHERE (which only resolve those
+    names) keep working against the table."""
+    return f"create table {table} (id int primary key, name text, email text)"
+
+
+def ins_into(table, *values):
+    """Positional INSERT into any table: ins_into('kv', 1, 'hello')."""
+    return f"insert into {table} " + " ".join(str(v) for v in values)
+
+
+def sel_from(table, cols="*", where=None):
+    query = f"select {cols} from {table}"
+    if where is not None:
+        query += f" where {where}"
+    return query
+
+
+def rows_of(lines):
+    """Every emitted record line (those starting with '(')."""
+    return [l for l in lines if l.startswith("(")]
+
+
+def ids_of(lines):
+    """The leading integer key of every emitted record line."""
+    return [int(r.split(",")[0].strip("( )")) for r in rows_of(lines)]
+
+
 def run_db(commands: list[str], db_file: str) -> list[str]:
     """Feed *commands* line-by-line to the binary and return output lines."""
     stdin = "\n".join(commands) + "\n"
@@ -1037,6 +1070,278 @@ class TestWALRecovery(DBTestCase):
         with open(self.wal_path(), "ab") as f:
             f.write(b"\xff" * 200)
         self.assertEqual(self.reopen_ids(), list(range(1, 15)))
+
+
+# ---------------------------------------------------------------------------
+# 11. Multiple tables
+#
+#     Every test above runs through a single `users` table, so none of the
+#     db->tables lookup, the per-table root page, or the multi-entry catalog is
+#     exercised. These create a SECOND table and assert the two behave as
+#     independent B-trees -- both in one session and across a restart (which
+#     forces open_db to rebuild every table by re-parsing its stored
+#     create_statement).
+# ---------------------------------------------------------------------------
+
+
+class TestMultipleTables(DBTestCase):
+
+    def test_two_tables_hold_independent_rows(self):
+        # users and pets share a schema but must not share a tree.
+        lines = self.run_cmds([
+            make_users_like("pets"),
+            ins(1, "alice", "a@x.com"),          # -> users
+            ins(2, "bob", "b@x.com"),            # -> users
+            ins_into("pets", 9, "rex", "r@x.com"),
+            sel_from("users"),
+            sel_from("pets"),
+            ".exit",
+        ])
+        # Users select must not surface the pets row and vice versa.
+        self.assertIn("(1, alice, a@x.com)", lines)
+        self.assertIn("(2, bob, b@x.com)", lines)
+        self.assertIn("(9, rex, r@x.com)", lines)
+
+    def test_same_key_in_two_tables_is_not_a_duplicate(self):
+        # id 1 exists in both tables; because each table is its own tree the
+        # second insert must NOT be rejected as a duplicate key.
+        lines = self.run_cmds([
+            make_users_like("pets"),
+            ins(1, "alice", "a@x.com"),
+            ins_into("pets", 1, "rex", "r@x.com"),
+            sel_from("pets"),
+            ".exit",
+        ])
+        self.assertNotIn("Error: Duplicate key.", lines)
+        self.assertIn("(1, rex, r@x.com)", lines)
+
+    def test_second_table_survives_restart(self):
+        run_db([
+            USERS_SCHEMA,
+            make_users_like("pets"),
+            ins(1, "alice", "a@x.com"),
+            ins_into("pets", 9, "rex", "r@x.com"),
+            ".exit",
+        ], self.db)
+        lines = strip_prompts(run_db([sel_from("pets"), ".exit"], self.db))
+        self.assertIn("(9, rex, r@x.com)", lines)
+
+    def test_both_tables_intact_after_restart(self):
+        run_db([
+            USERS_SCHEMA,
+            make_users_like("pets"),
+            ins(1, "alice", "a@x.com"),
+            ins_into("pets", 9, "rex", "r@x.com"),
+            ".exit",
+        ], self.db)
+        u = strip_prompts(run_db([sel_from("users"), ".exit"], self.db))
+        p = strip_prompts(run_db([sel_from("pets"), ".exit"], self.db))
+        self.assertEqual(ids_of(u), [1])
+        self.assertEqual(ids_of(p), [9])
+
+    def test_split_in_one_table_leaves_the_other_untouched(self):
+        # Fill users past a leaf split; pets keeps its single row. A bug that
+        # crossed the trees' page bookkeeping would corrupt one of them.
+        cmds = [make_users_like("pets"), ins_into("pets", 1, "rex", "r@x.com")]
+        cmds += [ins(i, f"user{i}", f"u{i}@x.com") for i in range(1, 15)]
+        cmds += [sel_from("pets"), sel_from("users"), ".exit"]
+        lines = self.run_cmds(cmds)
+        self.assertEqual(ids_of([l for l in lines if l == "(1, rex, r@x.com)"]), [1])
+        self.assertIn("(1, rex, r@x.com)", lines)
+        # users still has all 14 rows.
+        user_rows = [l for l in rows_of(lines) if "user" in l]
+        self.assertEqual(len(user_rows), 14)
+
+    def test_four_tables_all_usable(self):
+        # tables[0] is the catalog, so MAX_TABLES (5) leaves room for 4 user
+        # tables. Create the ceiling and confirm each is an independent tree.
+        names = ["t1", "t2", "t3", "t4"]
+        cmds = [make_users_like(n) for n in names]
+        cmds += [ins_into(n, i + 1, f"u{n}", f"{n}@x.com")
+                 for i, n in enumerate(names)]
+        cmds += [sel_from(n) for n in names] + [".exit"]
+        lines = self.run_cmds(cmds, create=False)
+        for i, n in enumerate(names):
+            self.assertIn(f"({i + 1}, u{n}, {n}@x.com)", lines)
+
+
+# ---------------------------------------------------------------------------
+# 12. Statements against a table that does not exist
+#
+#     execute_statement() looks the table up by name but never checks whether
+#     the lookup succeeded, so a missing table leaves `table` pointing at a
+#     fresh uninitialized malloc -> the executor dereferences a garbage schema.
+#     As with TestInsertValidation, each test pairs the bad statement with a
+#     known-good one and requires the good result to appear, so a crash on the
+#     bad statement (nothing printed afterward) fails the test.
+#
+#     EXPECTED TO FAIL until execute_statement rejects an unknown table name.
+# ---------------------------------------------------------------------------
+
+
+class TestUnknownTable(DBTestCase):
+
+    def test_insert_into_unknown_table_does_not_corrupt_db(self):
+        lines = self.run_cmds([
+            ins_into("ghost", 1, "x", "x@x.com"),   # no such table
+            ins(42, "good", "g@x.com"),             # real table, must survive
+            sel(),
+            ".exit",
+        ])
+        self.assertEqual(rows_of(lines), ["(42, good, g@x.com)"])
+
+    def test_select_from_unknown_table_does_not_crash(self):
+        lines = self.run_cmds([
+            ins(42, "good", "g@x.com"),
+            sel_from("ghost"),                       # no such table
+            sel(),                                   # must still run
+            ".exit",
+        ])
+        self.assertIn("(42, good, g@x.com)", lines)
+
+    def test_delete_from_unknown_table_does_not_crash(self):
+        lines = self.run_cmds([
+            ins(42, "good", "g@x.com"),
+            "delete from ghost 1",                   # no such table
+            sel(),
+            ".exit",
+        ])
+        self.assertIn("(42, good, g@x.com)", lines)
+
+
+# ---------------------------------------------------------------------------
+# 13. rowid keying: tables without an INTEGER PRIMARY KEY
+#
+#     execute_insert() keys a row on its INTEGER PRIMARY KEY when the schema has
+#     one, and otherwise (no PK, or a TEXT PK) falls back to an auto-assigned
+#     rowid from table->rowid_counter. Nothing above ever leaves the int-PK
+#     path, so the entire rowid branch is untested. These build such tables and
+#     use `select *` only, since projection/WHERE resolve id/name/email only.
+# ---------------------------------------------------------------------------
+
+
+class TestRowidKeying(DBTestCase):
+
+    def test_no_pk_two_rows_both_stored(self):
+        # No PK -> each insert gets its own rowid, so two rows with identical
+        # content must NOT collide as a duplicate key.
+        lines = self.run_cmds([
+            "create table logs (msg text)",
+            ins_into("logs", "hello"),
+            ins_into("logs", "world"),
+            sel_from("logs"),
+            ".exit",
+        ], create=False)
+        self.assertNotIn("Error: Duplicate key.", lines)
+        self.assertEqual(rows_of(lines), ["(hello)", "(world)"])
+
+    def test_text_pk_does_not_enforce_uniqueness(self):
+        # A TEXT primary key still keys on rowid (the alias only applies to
+        # INTEGER PRIMARY KEY), so duplicate text values are both stored.
+        lines = self.run_cmds([
+            "create table logs (msg text primary key)",
+            ins_into("logs", "dup"),
+            ins_into("logs", "dup"),
+            sel_from("logs"),
+            ".exit",
+        ], create=False)
+        self.assertNotIn("Error: Duplicate key.", lines)
+        self.assertEqual(rows_of(lines), ["(dup)", "(dup)"])
+
+    def test_auto_rowid_does_not_collide_across_restart(self):
+        # The crux: on reopen the counter must be restored above the highest
+        # existing rowid (open_db uses get_rightmost_rowid + 1). If it reset to
+        # 1 instead, the post-restart insert would reuse rowid 1 and clobber the
+        # first row. Distinct payloads let us prove both survived.
+        run_db(["create table logs (msg text)",
+                ins_into("logs", "first"), ".exit"], self.db)
+        run_db([ins_into("logs", "second"), ".exit"], self.db)
+        lines = strip_prompts(run_db([sel_from("logs"), ".exit"], self.db))
+        self.assertEqual(rows_of(lines), ["(first)", "(second)"])
+
+    def test_no_pk_rows_survive_leaf_split(self):
+        # Auto-rowid rows must page-split like keyed rows do.
+        cmds = ["create table logs (msg text)"]
+        cmds += [ins_into("logs", f"m{i}") for i in range(20)]
+        cmds += [sel_from("logs"), ".exit"]
+        lines = self.run_cmds(cmds, create=False)
+        self.assertEqual(len(rows_of(lines)), 20)
+
+
+# ---------------------------------------------------------------------------
+# 14. Arbitrary schemas (shape other than id/name/email)
+#
+#     The catalog stores each table's create_statement and open_db rebuilds the
+#     schema by re-parsing it. Every test above uses the one users shape, so a
+#     bug in reconstructing a differently-shaped schema (column count/types)
+#     would go unseen. Uses `select *` only.
+# ---------------------------------------------------------------------------
+
+
+class TestArbitrarySchema(DBTestCase):
+
+    def test_two_column_table_roundtrips(self):
+        lines = self.run_cmds([
+            "create table kv (k int primary key, v text)",
+            ins_into("kv", 1, "hello"),
+            sel_from("kv"),
+            ".exit",
+        ], create=False)
+        self.assertIn("(1, hello)", lines)
+
+    def test_wide_table_roundtrips(self):
+        # Five columns of mixed type in one record.
+        lines = self.run_cmds([
+            "create table wide (a int primary key, b text, c int, d text, e int)",
+            ins_into("wide", 1, "two", 3, "four", 5),
+            sel_from("wide"),
+            ".exit",
+        ], create=False)
+        self.assertIn("(1, two, 3, four, 5)", lines)
+
+    def test_arbitrary_schema_persists_across_restart(self):
+        # Exercises open_db's re-parse of a NON-users create_statement.
+        run_db([
+            "create table kv (k int primary key, v text)",
+            ins_into("kv", 1, "hello"),
+            ins_into("kv", 2, "world"),
+            ".exit",
+        ], self.db)
+        lines = strip_prompts(run_db([sel_from("kv"), ".exit"], self.db))
+        self.assertEqual(rows_of(lines), ["(1, hello)", "(2, world)"])
+
+
+# ---------------------------------------------------------------------------
+# 15. CREATE TABLE edge cases
+# ---------------------------------------------------------------------------
+
+
+class TestCreateTableEdges(DBTestCase):
+
+    def test_recreating_a_table_keeps_it_coherent(self):
+        # Whether a second `create table users` is rejected or ignored is a
+        # design choice; either way the table must remain ONE coherent tree.
+        # Duplicate-key detection on it proves the rows share a single tree.
+        lines = self.run_cmds([
+            USERS_SCHEMA,               # users created a second time
+            ins(1, "alice", "a@x.com"),
+            ins(1, "bob", "b@x.com"),   # same key -> must be rejected
+            ".exit",
+        ])
+        self.assertIn("Error: Duplicate key.", lines)
+
+    def test_insert_before_any_create_does_not_crash(self):
+        # No user table exists yet; the insert must be rejected, and the REPL
+        # must stay alive to serve a following create + insert + select.
+        lines = self.run_cmds([
+            ins(1, "early", "e@x.com"),   # nothing to insert into
+            USERS_SCHEMA,
+            ins(2, "later", "l@x.com"),
+            sel(),
+            ".exit",
+        ], create=False)
+        self.assertIn("(2, later, l@x.com)", lines)
+        self.assertNotIn("(1, early, e@x.com)", lines)
 
 
 if __name__ == "__main__":
