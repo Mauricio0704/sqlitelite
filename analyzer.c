@@ -10,11 +10,11 @@ int record_matches_schema(Record record, Schema *schema) {
   (void)record;
   (void)schema;
 
-  if (record.num_values != schema->n_cols)
+  if (record.n_vals != schema->n_cols)
     return 0;
 
-  for (int i = 0; i < record.num_values; i++) {
-    ColumnType record_type = record.values[i].type;
+  for (int i = 0; i < record.n_vals; i++) {
+    ColumnType record_type = record.vals[i].type;
     ColumnType schema_type = schema->col_types[i];
 
     if (record_type != schema_type)

@@ -207,11 +207,11 @@ Database *open_db(char *filename) {
     
     for (int i = 0; i < num_cells; i++) {
       Statement stmt;
-      const char *raw = node_records[i].values[2].text_val.str;
+      const char *raw = node_records[i].vals[2].text_val.str;
       Token *tokens = lexer(raw);
       parse_statement(tokens, raw, &stmt);
       db->tables[i + 1] = new_table_from_stmt(pager, &stmt);
-      db->tables[i + 1]->root_page_num = node_records[i].values[3].int_val;
+      db->tables[i + 1]->root_page_num = node_records[i].vals[3].int_val;
       db->num_tables++;
       db->tables[i + 1]->rowid_counter = get_rightmost_rowid(db->tables[i + 1]) + 1;
     }

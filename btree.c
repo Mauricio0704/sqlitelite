@@ -176,26 +176,29 @@ uint32_t get_rightmost_rowid(Table *table) {
   return leaf_node_key_at_slot(node, num_cells - 1);
 }
 
-/* Serializes an in-memory Record into its fixed-width on-page layout. */
-void write_serialized_record(Record *source, void *destination) {
-  uint32_t CURR_OFFSET = 0;
+void write_serialized_uint32(uint32_t val, void **dest) {
+  memcpy(*dest, &(val), sizeof(uint32_t));
+  *dest += sizeof(uint32_t);
+}
 
-  for (size_t i = 0; i < source->num_values; i++) {
-    Value curr_value = source->values[i];
-    switch (curr_value.type) {
+void write_serialized_str(char *str, uint32_t len, void **dest) {
+  write_serialized_uint32(len, dest);
+
+  size_t str_size = sizeof(char) * len;
+  memcpy(*dest, str, str_size);
+  *dest += str_size;
+}
+
+/* Serializes an in-memory Record into its fixed-width on-page layout. */
+void write_serialized_record(Record *src, void *dest) {
+  for (size_t i = 0; i < src->n_vals; i++) {
+    Value val = src->vals[i];
+    switch (val.type) {
     case INT:
-      memcpy(destination + CURR_OFFSET, &(curr_value.int_val),
-             sizeof(uint32_t));
-      CURR_OFFSET += sizeof(uint32_t);
+      write_serialized_uint32(val.int_val, &dest);
       break;
     case TEXT:
-      memcpy(destination + CURR_OFFSET, &(curr_value.text_val.len),
-             sizeof(uint32_t));
-      CURR_OFFSET += sizeof(uint32_t);
-      size_t text_value_size = sizeof(char) * curr_value.text_val.len;
-      memcpy(destination + CURR_OFFSET, curr_value.text_val.str,
-             text_value_size);
-      CURR_OFFSET += text_value_size;
+      write_serialized_str(val.text_val.str, val.text_val.len, &dest);
       break;
     default:
       break;
@@ -203,33 +206,35 @@ void write_serialized_record(Record *source, void *destination) {
   }
 }
 
-/* Deserializes a fixed-width on-page record into an in-memory Record. */
-void read_deserialized_record(void *source, Record *destination,
-                              Schema *schema) {
-  uint32_t CURR_OFFSET = 0;
-  uint32_t num_columns = schema->n_cols;
-  destination->num_values = num_columns;
-  destination->values = malloc(sizeof(Value) * destination->num_values);
+void read_deserialized_uint32(void **src, uint32_t *val) {
+  memcpy(val, *src, sizeof(uint32_t));
+  *src += sizeof(uint32_t);
+}
 
-  for (size_t i = 0; i < num_columns; i++) {
-    ColumnType curr_type = schema->col_types[i];
-    Value *curr_value = &(destination->values[i]);
-    switch (curr_type) {
+void read_deserialized_str(void **src, char **str, uint32_t *len) {
+  read_deserialized_uint32(src, len);
+
+  size_t text_size = sizeof(char) * (*len);
+  *str = strndup(*src, text_size);
+  *src += text_size;
+}
+
+/* Deserializes a fixed-width on-page record into an in-memory Record. */
+void read_deserialized_record(void *src, Record *dest, Schema *schema) {
+  dest->n_vals = schema->n_cols;
+  dest->vals = malloc(sizeof(Value) * dest->n_vals);
+
+  for (size_t i = 0; i < schema->n_cols; i++) {
+    ColumnType type = schema->col_types[i];
+    Value *val = &(dest->vals[i]);
+    switch (type) {
     case INT:
-      curr_value->type = INT;
-      memcpy(&(curr_value->int_val), source + CURR_OFFSET, sizeof(uint32_t));
-      CURR_OFFSET += sizeof(uint32_t);
+      val->type = INT;
+      read_deserialized_uint32(&src, &val->int_val);
       break;
     case TEXT:
-      curr_value->type = TEXT;
-      memcpy(&(curr_value->text_val.len), source + CURR_OFFSET,
-             sizeof(uint32_t));
-      CURR_OFFSET += sizeof(uint32_t);
-      size_t text_value_size = sizeof(char) * curr_value->text_val.len;
-      curr_value->text_val.str = malloc(text_value_size + 1);
-      memcpy(curr_value->text_val.str, source + CURR_OFFSET, text_value_size);
-      curr_value->text_val.str[curr_value->text_val.len] = '\0';
-      CURR_OFFSET += text_value_size;
+      val->type = TEXT;
+      read_deserialized_str(&src, &val->text_val.str, &val->text_val.len);
       break;
     default:
       break;
@@ -550,8 +555,8 @@ void leaf_node_split(Cursor *cursor, void *node, uint32_t key, Record *record) {
 
 uint32_t leaf_node_cell_size(Record *record) {
   uint32_t cell_size = LEAF_NODE_CELL_KEY_SIZE;
-  for (size_t i = 0; i < record->num_values; i++) {
-    Value curr_value = record->values[i];
+  for (size_t i = 0; i < record->n_vals; i++) {
+    Value curr_value = record->vals[i];
     switch (curr_value.type) {
     case INT:
       cell_size += sizeof(uint32_t);
@@ -571,7 +576,7 @@ uint32_t leaf_node_cell_size(Record *record) {
  */
 void leaf_node_insert(Cursor *cursor, uint32_t key, Record *record) {
   void *node = get_page(cursor->table->pager, cursor->page_num);
-  
+
   uint32_t free_start = *leaf_node_free_start(node);
   uint32_t free_end = *leaf_node_free_end(node);
   uint32_t cell_size = leaf_node_cell_size(record);

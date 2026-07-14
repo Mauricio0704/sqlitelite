@@ -14,10 +14,10 @@
 void print_row(Record record, int *projection_idxs, size_t projection_count) {
   if (projection_count == 0) {
     printf("(");
-    for (size_t i = 0; i < record.num_values; i++) {
+    for (size_t i = 0; i < record.n_vals; i++) {
       if (i > 0)
         printf(", ");
-      Value curr_value = record.values[i];
+      Value curr_value = record.vals[i];
       switch (curr_value.type) {
       case INT:
         printf("%d", curr_value.int_val);
@@ -37,7 +37,7 @@ void print_row(Record record, int *projection_idxs, size_t projection_count) {
   for (size_t i = 0; i < projection_count; i++) {
     if (i > 0)
       printf(", ");
-    Value curr_value = record.values[projection_idxs[i]];
+    Value curr_value = record.vals[projection_idxs[i]];
     switch (curr_value.type) {
     case INT:
       printf("%d", curr_value.int_val);
@@ -61,10 +61,10 @@ ExecuteStatus execute_insert(InsertStmt *stmt, Table *table) {
   uint32_t pk_col = table->schema->pk_idx;
 
   /* If PK is not defined or it is TEXT, should use rowid */
-  if (pk_col == UINT32_MAX || record.values[pk_col].type == TEXT)
+  if (pk_col == UINT32_MAX || record.vals[pk_col].type == TEXT)
     key = table->rowid_counter;
   else
-    key = record.values[pk_col].int_val;
+    key = record.vals[pk_col].int_val;
 
   int key_exists;
   Cursor *cursor = find_key_cursor(table, key, &key_exists);
@@ -104,7 +104,7 @@ uint8_t apply_operator(TokenType operator, int cmp) {
 uint8_t row_matches(Expr *where_expr, Record record) {
   switch (where_expr->kind) {
   case COMPARISON: {
-    Value curr_val = record.values[where_expr->col_idx];
+    Value curr_val = record.vals[where_expr->col_idx];
     switch (curr_val.type) {
     case INT: {
       int cmp = (curr_val.int_val > where_expr->intval) -
@@ -188,24 +188,24 @@ void execute_delete(DeleteStmt *stmt, Table *table) {
 
 Record get_new_table_record(CreateStmt *stmt, uint32_t root_page_num) {
   Record record;
-  record.num_values = 4;
-  record.values = malloc(sizeof(Value) * 4);
+  record.n_vals = 4;
+  record.vals = malloc(sizeof(Value) * 4);
 
-  record.values[0] = (Value){INT, TABLE};
-  record.values[1].type = TEXT;
-  record.values[1].text_val.len = strlen(stmt->new_table_name);
-  record.values[1].text_val.str =
-      strndup(stmt->new_table_name, record.values[1].text_val.len);
-  record.values[2].type = TEXT;
+  record.vals[0] = (Value){INT, TABLE};
+  record.vals[1].type = TEXT;
+  record.vals[1].text_val.len = strlen(stmt->new_table_name);
+  record.vals[1].text_val.str =
+      strndup(stmt->new_table_name, record.vals[1].text_val.len);
+  record.vals[2].type = TEXT;
   if (stmt->raw_stmt != NULL) {
-    record.values[2].text_val.str = strdup(stmt->raw_stmt);
-    record.values[2].text_val.len =
-        (uint32_t)strlen(record.values[2].text_val.str);
+    record.vals[2].text_val.str = strdup(stmt->raw_stmt);
+    record.vals[2].text_val.len =
+        (uint32_t)strlen(record.vals[2].text_val.str);
   } else {
-    record.values[2].text_val.str = NULL;
-    record.values[2].text_val.len = 0;
+    record.vals[2].text_val.str = NULL;
+    record.vals[2].text_val.len = 0;
   }
-  record.values[3] = (Value){INT, root_page_num};
+  record.vals[3] = (Value){INT, root_page_num};
   return record;
 }
 

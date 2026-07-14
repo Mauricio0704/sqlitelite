@@ -23,8 +23,8 @@ typedef struct {
 } Value;
 
 typedef struct {
-  Value *values;
-  size_t num_values;
+  Value *vals;
+  size_t n_vals;
 } Record;
 
 typedef enum { TABLE } CatalogType;

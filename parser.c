@@ -233,28 +233,28 @@ PrepareStatus parse_insert(Token *toks, Statement *stmt) {
   stmt->insert_stmt = malloc(sizeof(InsertStmt));
 
   Record *record = &stmt->insert_stmt->record;
-  record->num_values = 0;
-  record->values = malloc(sizeof(Value) * 8); /* Placeholder */
+  record->n_vals = 0;
+  record->vals = malloc(sizeof(Value) * 8); /* Placeholder */
 
   uint16_t token_idx = 3;
   while (toks[token_idx].type != TOKEN_EOF) {
     Token curr_token = toks[token_idx];
     switch (curr_token.type) {
     case TOKEN_INT_LITERAL:
-      record->values[record->num_values].type = INT;
-      record->values[record->num_values].int_val =
+      record->vals[record->n_vals].type = INT;
+      record->vals[record->n_vals].int_val =
           (uint32_t)strtol(curr_token.start_lexeme, NULL, 10);
-      record->num_values += 1;
+      record->n_vals += 1;
       break;
     case TOKEN_IDENTIFIER: {
-      Value *curr_value = &(record->values[record->num_values]);
+      Value *curr_value = &(record->vals[record->n_vals]);
       curr_value->type = TEXT;
       curr_value->text_val.len = curr_token.len_lexeme;
       curr_value->text_val.str = malloc(curr_value->text_val.len + 1);
       memcpy(curr_value->text_val.str, curr_token.start_lexeme,
              curr_token.len_lexeme);
       curr_value->text_val.str[curr_token.len_lexeme] = '\0';
-      record->num_values += 1;
+      record->n_vals += 1;
       break;
     }
     default:
