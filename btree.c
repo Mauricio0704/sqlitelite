@@ -176,6 +176,15 @@ uint32_t get_rightmost_rowid(Table *table) {
   return leaf_node_key_at_slot(node, num_cells - 1);
 }
 
+void free_record(Record *record) {
+  for (int i = 0; i < record->n_vals; i++) {
+    Value val = record->vals[i];
+    if (val.type == TEXT)
+      free(val.text_val.str);
+  }
+  free(record->vals);
+}
+
 void write_serialized_uint32(uint32_t val, void **dest) {
   memcpy(*dest, &(val), sizeof(uint32_t));
   *dest += sizeof(uint32_t);

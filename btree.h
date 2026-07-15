@@ -103,6 +103,7 @@ void initialize_internal_node(void *node);
 void initialize_leaf_node(void *node);
 Cursor *leaf_node_offset_find(Table *table, uint32_t page_num, uint32_t key);
 uint32_t get_rightmost_rowid(Table *table);
+void free_record(Record *record);
 void write_serialized_record(Record *source, void *destination);
 void read_deserialized_record(void *source, Record *destination, Schema *schema);
 void internal_node_insert_key(Pager *pager, uint32_t parent_page_num,

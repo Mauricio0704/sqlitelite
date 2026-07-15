@@ -132,19 +132,12 @@ uint8_t row_matches(Expr *where_expr, Record record) {
 void execute_select(SelectStmt *stmt, Table *table) {
   Cursor *cursor = new_cursor_start(table);
 
-  void *node = get_page(table->pager, cursor->page_num);
-
-  while (*node_type_value(node) != NODE_TYPE_LEAF) {
-    uint32_t child_page_num = *internal_node_pointer(node, 0);
-    node = get_page(table->pager, child_page_num);
-    cursor->page_num = child_page_num;
-  }
-
   while (!(cursor->is_end_of_table)) {
     Record record;
     read_deserialized_record(get_record_start(cursor), &record, table->schema);
     if (!stmt->has_where || row_matches(stmt->where_expr, record))
       print_row(record, stmt->projection_idxs, stmt->projection_count);
+    free_record(&record);
     advance_cursor(cursor);
   }
 
@@ -199,8 +192,7 @@ Record get_new_table_record(CreateStmt *stmt, uint32_t root_page_num) {
   record.vals[2].type = TEXT;
   if (stmt->raw_stmt != NULL) {
     record.vals[2].text_val.str = strdup(stmt->raw_stmt);
-    record.vals[2].text_val.len =
-        (uint32_t)strlen(record.vals[2].text_val.str);
+    record.vals[2].text_val.len = (uint32_t)strlen(record.vals[2].text_val.str);
   } else {
     record.vals[2].text_val.str = NULL;
     record.vals[2].text_val.len = 0;
