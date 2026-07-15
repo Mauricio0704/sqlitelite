@@ -7,9 +7,6 @@
 #include <string.h>
 
 int record_matches_schema(Record record, Schema *schema) {
-  (void)record;
-  (void)schema;
-
   if (record.n_vals != schema->n_cols)
     return 0;
 
@@ -76,16 +73,28 @@ ExecuteStatus analyze(Statement *stmt, Database *db, Table **out) {
   if (found == 0) {
     return EXECUTE_TABLE_NOT_FOUND;
   }
-  if (stmt->type == STATEMENT_INSERT) {
+  switch (stmt->type) {
+  case STATEMENT_INSERT:
     if (record_matches_schema(stmt->insert_stmt->record, (*out)->schema) == 0)
       return EXECUTE_SCHEMA_MISMATCH;
-  } else if (stmt->type == STATEMENT_SELECT) {
+    break;
+  case STATEMENT_SELECT:
     if (columns_match_schema(stmt->select_stmt, (*out)->schema) == 0)
       return EXECUTE_SCHEMA_MISMATCH;
     if (stmt->select_stmt->has_where &&
         where_matches_schema(stmt->select_stmt->where_expr, (*out)->schema) ==
             0)
       return EXECUTE_SCHEMA_MISMATCH;
+    break;
+  case STATEMENT_DELETE:
+    if (stmt->delete_stmt->has_where &&
+        where_matches_schema(stmt->delete_stmt->where_expr, (*out)->schema) ==
+            0)
+      return EXECUTE_SCHEMA_MISMATCH;
+    break;
+  default:
+    break;
   }
+
   return EXECUTE_SUCCESS;
 }

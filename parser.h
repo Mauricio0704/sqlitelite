@@ -33,6 +33,8 @@ typedef struct {
 
 typedef struct {
   uint32_t id_to_delete;
+  int has_where;
+  Expr *where_expr;
 } DeleteStmt;
 
 typedef struct {
@@ -55,12 +57,10 @@ typedef struct {
 } Statement;
 
 int is_value_token(TokenType type);
-Expr *parse_comparison(Token *tokens, uint32_t *pos);
-Expr *parse_and(Token *tokens, uint32_t *pos);
-Expr *parse_or(Token *tokens, uint32_t *pos);
 Expr *parse_expr(Token *tokens, uint32_t *pos);
 void free_expr(Expr *expr); // recursive teardown
 void free_select_stmt(SelectStmt *stmt);
+void free_delete_stmt(DeleteStmt *stmt);
 PrepareStatus parse_statement(Token *tokens, const char *raw,
                               Statement *statement);
 PrepareStatus prepare_statement(const char *in, Statement *statement);

@@ -48,8 +48,8 @@ def sel(cols="*", where=None):
 
 
 def dele(id):
-    """Build a qualified DELETE for the users table."""
-    return f"delete from users {id}"
+    """Build a qualified DELETE for the users table (deletes the row with this id)."""
+    return f"delete from users where id = {id}"
 
 
 # --- generic, table-name-parameterized builders ----------------------------
@@ -767,12 +767,16 @@ class TestDeleteBasic(DBTestCase):
         self.assertEqual(ids, [1, 3])
 
     def test_delete_nonexistent_key(self):
+        # A WHERE that matches nothing is a no-op; the existing row survives.
         lines = self.run_cmds([
             ins(1, "alice", "a@x.com"),
             dele(99),
+            sel(),
             ".exit",
         ])
-        self.assertIn("Key 99 does not exist", lines)
+        rows = [l for l in lines if l.startswith("(")]
+        ids = [int(r.split(",")[0].strip("( ")) for r in rows]
+        self.assertEqual(ids, [1])
 
     def test_delete_first_key(self):
         lines = self.run_cmds([
@@ -836,6 +840,19 @@ class TestDeleteBasic(DBTestCase):
         rows = [l for l in lines if l.startswith("(")]
         ids = [int(r.split(",")[0].strip("( ")) for r in rows]
         self.assertEqual(ids, [1, 3])
+
+    def test_delete_all_no_where(self):
+        # DELETE with no WHERE removes every row.
+        lines = self.run_cmds([
+            ins(1, "alice", "a@x.com"),
+            ins(2, "bob", "b@x.com"),
+            ins(3, "charlie", "c@x.com"),
+            "delete from users",
+            sel(),
+            ".exit",
+        ])
+        rows = [l for l in lines if l.startswith("(")]
+        self.assertEqual(len(rows), 0)
 
 
 # ---------------------------------------------------------------------------

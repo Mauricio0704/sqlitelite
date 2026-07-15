@@ -145,38 +145,35 @@ void execute_select(SelectStmt *stmt, Table *table) {
 }
 
 void execute_delete(DeleteStmt *stmt, Table *table) {
-  uint32_t key = stmt->id_to_delete;
+  Cursor *cursor = new_cursor_start(table);
+  uint32_t capacity = 16;
+  uint32_t matches = 0;
+  uint32_t *keys = malloc(sizeof(uint32_t) * capacity);
 
-  int key_exists;
-  Cursor *cursor = find_key_cursor(table, key, &key_exists);
-  if (!key_exists) {
-    printf("Key %d does not exist\n", key);
-    free(cursor);
-    return;
+  while (!(cursor->is_end_of_table)) {
+    Record record;
+    read_deserialized_record(get_record_start(cursor), &record, table->schema);
+    if (!stmt->has_where || row_matches(stmt->where_expr, record)) {
+      if (matches == capacity) {
+        capacity *= 2;
+        keys = realloc(keys, sizeof(uint32_t) * capacity);
+      }
+      void *node = get_page(table->pager, cursor->page_num);
+      keys[matches++] = leaf_node_key_at_slot(node, cursor->slot_num);
+    }
+    free_record(&record);
+    advance_cursor(cursor);
   }
-
-  void *node = get_page(table->pager, cursor->page_num);
-  uint32_t num_cells = *leaf_node_num_cells(node);
-  uint32_t deleted_page = cursor->page_num;
-
-  /* Remove the slot entry by shifting later slots left. */
-  for (uint32_t i = cursor->slot_num + 1; i < num_cells; ++i) {
-    *leaf_node_offset_value(node, i - 1) = *leaf_node_offset_value(node, i);
-  }
-  *leaf_node_num_cells(node) -= 1;
-  *leaf_node_free_start(node) -= LEAF_NODE_SLOT_SIZE;
-
-  pager_mark_dirty(table->pager, deleted_page);
-
-  /* Check for underflow: non-root leaf dropped below minimum occupancy. */
-  if (!*node_is_root_value(node) &&
-      *leaf_node_num_cells(node) < LEAF_NODE_MIN_CELLS) {
-    handle_underflow(table->pager, table, deleted_page);
-  }
-
-  flush_to_wal(table->pager);
-
   free(cursor);
+
+  for (uint32_t i = 0; i < matches; i++) {
+    int key_exists;
+    Cursor *del_cursor = find_key_cursor(table, keys[i], &key_exists);
+    delete_record(del_cursor);
+    free(del_cursor);
+  }
+
+  free(keys);
 }
 
 Record get_new_table_record(CreateStmt *stmt, uint32_t root_page_num) {
@@ -184,7 +181,7 @@ Record get_new_table_record(CreateStmt *stmt, uint32_t root_page_num) {
   record.n_vals = 4;
   record.vals = malloc(sizeof(Value) * 4);
 
-  record.vals[0] = (Value){INT, TABLE};
+  record.vals[0] = (Value){INT, {TABLE}};
   record.vals[1].type = TEXT;
   record.vals[1].text_val.len = strlen(stmt->new_table_name);
   record.vals[1].text_val.str =
@@ -197,7 +194,7 @@ Record get_new_table_record(CreateStmt *stmt, uint32_t root_page_num) {
     record.vals[2].text_val.str = NULL;
     record.vals[2].text_val.len = 0;
   }
-  record.vals[3] = (Value){INT, root_page_num};
+  record.vals[3] = (Value){INT, {root_page_num}};
   return record;
 }
 
@@ -224,6 +221,8 @@ ExecuteStatus execute_statement(Statement *stmt, Database *db) {
   if (status != EXECUTE_SUCCESS) {
     if (stmt->type == STATEMENT_SELECT)
       free_select_stmt(stmt->select_stmt);
+    else if (stmt->type == STATEMENT_DELETE)
+      free_delete_stmt(stmt->delete_stmt);
     return status;
   }
 
@@ -236,6 +235,7 @@ ExecuteStatus execute_statement(Statement *stmt, Database *db) {
     break;
   case STATEMENT_DELETE:
     execute_delete(stmt->delete_stmt, table);
+    free_delete_stmt(stmt->delete_stmt);
     break;
   case STATEMENT_CREATE:
     execute_create(stmt->create_stmt,

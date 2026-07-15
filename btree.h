@@ -103,39 +103,20 @@ void initialize_internal_node(void *node);
 void initialize_leaf_node(void *node);
 Cursor *leaf_node_offset_find(Table *table, uint32_t page_num, uint32_t key);
 uint32_t get_rightmost_rowid(Table *table);
+void delete_record(Cursor *cursor);
 void free_record(Record *record);
 void write_serialized_record(Record *source, void *destination);
 void read_deserialized_record(void *source, Record *destination, Schema *schema);
 void internal_node_insert_key(Pager *pager, uint32_t parent_page_num,
                               uint32_t promoted_key, uint32_t left_child_page,
                               uint32_t right_child_page);
-void internal_node_split(Pager *pager, uint32_t node_page_num, uint32_t new_key,
-                         uint32_t new_right_child);
 void leaf_node_insert(Cursor *cursor, uint32_t key, Record *record);
-void leaf_node_split(Cursor *cursor, void *node, uint32_t key, Record *record);
 Cursor *find_key_cursor(Table *table, uint32_t key, int *key_exists);
 uint32_t leaf_node_read_all_cells(void *node, uint32_t *keys_out,
                                   Record *records_out, Schema *schema);
-void leaf_node_rebuild(void *node, uint32_t *keys, Record *records,
-                       uint32_t count, uint32_t next_ptr);
 int32_t find_child_index_in_parent(void *parent, uint32_t child_page);
 uint32_t internal_node_child(void *node, uint32_t child_index);
 void internal_node_remove_key(void *node, uint32_t key_index);
-void collapse_root(Table *table);
-void leaf_node_redistribute(Schema *schema, Pager *pager, uint32_t node_page_num,
-                            uint32_t sibling_page_num, uint32_t separator_index,
-                            int sibling_is_left);
-void leaf_node_merge(Schema *schema, Pager *pager, uint32_t left_page_num,
-                     uint32_t right_page_num, uint32_t separator_index);
 uint32_t internal_node_num_children(void *node);
-void internal_node_redistribute(Pager *pager, uint32_t node_page_num,
-                                uint32_t sibling_page_num,
-                                uint32_t separator_index, int sibling_is_left);
-void internal_node_merge(Pager *pager, uint32_t left_page_num,
-                         uint32_t right_page_num, uint32_t separator_index);
-void handle_internal_node_underflow(Pager *pager, uint32_t page_num,
-                                    void *parent, int32_t child_idx,
-                                    uint32_t num_parent_keys);
-void handle_underflow(Pager *pager, Table *table, uint32_t page_num);
 
 #endif /* BTREE_H */

@@ -34,6 +34,8 @@ Token classify_word(const char *start, size_t len) {
     return (Token){TOKEN_KW_AND, (char *)start, len};
   if (len == 2 && strncmp(start, "or", 2) == 0)
     return (Token){TOKEN_KW_OR, (char *)start, len};
+  if (len == 1 && strncmp(start, "*", 1) == 0)
+    return (Token){TOKEN_OP_ALL, (char *)start, len};
 
   for (size_t i = 0; i < len; i++) {
     if (!isdigit((unsigned char)start[i]))
@@ -42,7 +44,7 @@ Token classify_word(const char *start, size_t len) {
   return (Token){TOKEN_INT_LITERAL, (char *)start, len};
 }
 
-// Tokenizes one input line.
+/* Tokenizes one input line. */
 Token *lexer(const char *line) {
   size_t line_len = strlen(line);
 
@@ -58,8 +60,8 @@ Token *lexer(const char *line) {
   for (size_t i = 0; i <= line_len; i++) {
     char c = line[i]; /* line[line_len] is the terminating '\0' */
     int at_end = (i == line_len);
-    int is_punct = (c == ',' || c == '=' || c == '*' || c == '>' || c == '<' ||
-                    c == '(' || c == ')');
+    int is_punct =
+        (c == ',' || c == '=' || c == '>' || c == '<' || c == '(' || c == ')');
 
     /* A word token ends at whitespace, at single-char punctuation, or at the
      * terminating '\0'. Punctuation is then emitted as its own token. */
@@ -76,9 +78,6 @@ Token *lexer(const char *line) {
           break;
         case '=':
           type = TOKEN_OP_EQUAL;
-          break;
-        case '*':
-          type = TOKEN_OP_ALL;
           break;
         case '(':
           type = TOKEN_KW_LPAREN;

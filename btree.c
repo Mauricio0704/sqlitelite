@@ -1,11 +1,9 @@
 #include "btree.h"
 #include "common.h"
 #include "pager.h"
-#include <stddef.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/types.h>
 
 /* Returns a pointer to the node root flag field. */
 uint8_t *node_is_root_value(void *node) { return node + NODE_IS_ROOT_OFFSET; }
@@ -80,13 +78,20 @@ void *get_record_start(Cursor *cursor) {
          LEAF_NODE_CELL_KEY_SIZE;
 }
 
-/* Creates a cursor positioned at slot 0 of the current root page. */
+/* Creates a cursor positioned at first entry of Table. */
 Cursor *new_cursor_start(Table *table) {
   Cursor *new_cursor = (Cursor *)malloc(sizeof(Cursor));
   new_cursor->page_num = table->root_page_num;
   new_cursor->slot_num = 0;
   new_cursor->table = table;
   void *node = get_page(table->pager, new_cursor->page_num);
+
+  while (*node_type_value(node) != NODE_TYPE_LEAF) {
+    uint32_t page_num = *internal_node_pointer(node, 0);
+    node = get_page(table->pager, page_num);
+    new_cursor->page_num = page_num;
+  }
+  
   uint32_t num_cells = *leaf_node_num_cells(node);
   new_cursor->is_end_of_table = (num_cells == 0);
 
@@ -177,7 +182,7 @@ uint32_t get_rightmost_rowid(Table *table) {
 }
 
 void free_record(Record *record) {
-  for (int i = 0; i < record->n_vals; i++) {
+  for (size_t i = 0; i < record->n_vals; i++) {
     Value val = record->vals[i];
     if (val.type == TEXT)
       free(val.text_val.str);
@@ -1126,4 +1131,28 @@ void handle_underflow(Pager *pager, Table *table, uint32_t page_num) {
     collapse_root(table);
   else if (!*node_is_root_value(parent) && parent_keys < INTERNAL_NODE_MIN_KEYS)
     handle_underflow(pager, table, parent_page);
+}
+
+void delete_record(Cursor *cursor) {
+  Table *table = cursor->table;
+  void *node = get_page(table->pager, cursor->page_num);
+  uint32_t num_cells = *leaf_node_num_cells(node);
+  uint32_t deleted_page = cursor->page_num;
+
+  /* Remove the slot entry by shifting later slots left. */
+  for (uint32_t i = cursor->slot_num + 1; i < num_cells; ++i) {
+    *leaf_node_offset_value(node, i - 1) = *leaf_node_offset_value(node, i);
+  }
+  *leaf_node_num_cells(node) -= 1;
+  *leaf_node_free_start(node) -= LEAF_NODE_SLOT_SIZE;
+
+  pager_mark_dirty(table->pager, deleted_page);
+
+  /* Check for underflow: non-root leaf dropped below minimum occupancy. */
+  if (!*node_is_root_value(node) &&
+      *leaf_node_num_cells(node) < LEAF_NODE_MIN_CELLS) {
+    handle_underflow(table->pager, table, deleted_page);
+  }
+
+  flush_to_wal(table->pager);
 }

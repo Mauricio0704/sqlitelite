@@ -1,8 +1,6 @@
 #include "parser.h"
 #include "common.h"
 #include "lexer.h"
-#include <_string.h>
-#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -23,6 +21,12 @@ void free_expr(Expr *expr) {
 void free_select_stmt(SelectStmt *stmt) {
   for (size_t i = 0; i < stmt->projection_count; i++)
     free(stmt->projection_names[i]);
+  if (stmt->has_where)
+    free_expr(stmt->where_expr);
+  free(stmt);
+}
+
+void free_delete_stmt(DeleteStmt *stmt) {
   if (stmt->has_where)
     free_expr(stmt->where_expr);
   free(stmt);
@@ -189,7 +193,8 @@ PrepareStatus parse_select(Token *toks, Statement *stmt) {
           stmt->select_stmt->projection_count >= MAX_SELECT_COLUMNS)
         return PREPARE_FAILURE;
 
-      stmt->select_stmt->projection_names[stmt->select_stmt->projection_count++] =
+      stmt->select_stmt
+          ->projection_names[stmt->select_stmt->projection_count++] =
           strndup(toks[pos].start_lexeme, toks[pos].len_lexeme);
       pos++;
 
@@ -226,9 +231,7 @@ PrepareStatus parse_insert(Token *toks, Statement *stmt) {
   if (toks[1].type != TOKEN_KW_INTO || toks[2].type != TOKEN_IDENTIFIER)
     return PREPARE_FAILURE;
 
-  stmt->table_name = malloc(toks[2].len_lexeme + 1);
-  memcpy(stmt->table_name, toks[2].start_lexeme, toks[2].len_lexeme);
-  stmt->table_name[toks[2].len_lexeme] = '\0';
+  stmt->table_name = strndup(toks[2].start_lexeme, toks[2].len_lexeme);
 
   stmt->insert_stmt = malloc(sizeof(InsertStmt));
 
@@ -268,15 +271,39 @@ PrepareStatus parse_insert(Token *toks, Statement *stmt) {
 
 PrepareStatus parse_delete(Token *toks, Statement *stmt) {
   stmt->type = STATEMENT_DELETE;
-  if (toks[1].type != TOKEN_KW_FROM || toks[2].type != TOKEN_IDENTIFIER ||
-      toks[3].type != TOKEN_INT_LITERAL || toks[4].type != TOKEN_EOF) {
+  if (toks[1].type != TOKEN_KW_FROM || toks[2].type != TOKEN_IDENTIFIER) {
     printf("Incorrect arguments for delete\n");
     return PREPARE_FAILURE;
   }
+
   stmt->delete_stmt = malloc(sizeof(DeleteStmt));
   stmt->table_name = strndup(toks[2].start_lexeme, toks[2].len_lexeme);
-  stmt->delete_stmt->id_to_delete =
-      (uint32_t)strtol(toks[3].start_lexeme, NULL, 10);
+
+  /* No WHERE clause: delete every row. */
+  if (toks[3].type == TOKEN_EOF) {
+    stmt->delete_stmt->has_where = 0;
+    stmt->delete_stmt->where_expr = NULL;
+    return PREPARE_SUCCESS;
+  }
+
+  if (toks[3].type != TOKEN_KW_WHERE) {
+    printf("Incorrect arguments for delete\n");
+    free(stmt->table_name);
+    free(stmt->delete_stmt);
+    return PREPARE_FAILURE;
+  }
+
+  uint32_t wpos = 4; /* first token after WHERE */
+  Expr *where_expr = parse_expr(toks, &wpos);
+  if (where_expr == NULL || toks[wpos].type != TOKEN_EOF) {
+    free_expr(where_expr);
+    free(stmt->table_name);
+    free(stmt->delete_stmt);
+    return PREPARE_FAILURE;
+  }
+  stmt->delete_stmt->has_where = 1;
+  stmt->delete_stmt->where_expr = where_expr;
+
   return PREPARE_SUCCESS;
 }
 
