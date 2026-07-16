@@ -171,13 +171,25 @@ void load_catalog(Database *database, Pager *pager) {
   database->tables[0] = catalog_table;
 }
 
-Table *new_table_from_stmt(Pager *pgr, Statement *stmt) {
+Table *new_table_from_stmt(Pager *pgr, Statement *stmt,
+                           uint32_t root_page_num) {
   Table *table = malloc(sizeof(Table));
   table->pager = pgr;
-  table->schema = malloc(sizeof(Schema));
-  memcpy(table->schema, &(stmt->create_stmt->schema), sizeof(Schema));
+
+  Schema *src = &stmt->create_stmt->schema;
+  Schema *schema = malloc(sizeof(Schema));
+  schema->n_cols = src->n_cols;
+  schema->pk_idx = src->pk_idx;
+  schema->col_types = malloc(sizeof(ColumnType) * src->n_cols);
+  schema->col_names = malloc(sizeof(char *) * src->n_cols);
+  for (size_t i = 0; i < src->n_cols; i++) {
+    schema->col_types[i] = src->col_types[i];
+    schema->col_names[i] = strdup(src->col_names[i]);
+  }
+  table->schema = schema;
+
   table->table_name = strdup(stmt->create_stmt->new_table_name);
-  table->root_page_num = pgr->num_pages;
+  table->root_page_num = root_page_num;
   table->rowid_counter = get_rightmost_rowid(table) + 1;
   return table;
 }
@@ -209,11 +221,11 @@ Database *open_db(char *filename) {
       Statement stmt;
       const char *raw = node_records[i].vals[2].text_val.str;
       Token *tokens = lexer(raw);
-      parse_statement(tokens, raw, &stmt);
-      db->tables[i + 1] = new_table_from_stmt(pager, &stmt);
-      db->tables[i + 1]->root_page_num = node_records[i].vals[3].int_val;
+      Parser parser = {.toks = tokens, .pos = 0, .had_error = false};
+      parse_statement(&parser, raw, &stmt);
+      uint32_t root_page_num = node_records[i].vals[3].int_val;
+      db->tables[i + 1] = new_table_from_stmt(pager, &stmt, root_page_num);
       db->num_tables++;
-      db->tables[i + 1]->rowid_counter = get_rightmost_rowid(db->tables[i + 1]) + 1;
     }
   }
 

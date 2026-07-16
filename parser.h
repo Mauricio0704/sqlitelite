@@ -4,9 +4,11 @@
 #include "common.h"
 #include "lexer.h"
 
+#include <stdbool.h>
 #include <stddef.h>
 
 #define MAX_SELECT_COLUMNS 8
+#define MAX_TABLE_COLUMNS 8
 
 typedef enum { COMPARISON, AND_EXPR, OR_EXPR } ExprKind;
 
@@ -20,6 +22,12 @@ typedef struct Expr {
   struct Expr *left;  // Just for or/and
   struct Expr *right; // Just for or/and
 } Expr;
+
+typedef struct {
+  Token *toks;
+  uint32_t pos;
+  bool had_error;
+} Parser;
 
 typedef struct {
   Record record;
@@ -57,13 +65,13 @@ typedef struct {
 } Statement;
 
 int is_value_token(TokenType type);
-Expr *parse_expr(Token *tokens, uint32_t *pos);
+Expr *parse_expr(Parser *parser);
 void free_expr(Expr *expr); // recursive teardown
 void free_select_stmt(SelectStmt *stmt);
 void free_delete_stmt(DeleteStmt *stmt);
 void free_insert_stmt(InsertStmt *stmt);
 void free_create_stmt(CreateStmt *stmt);
-PrepareStatus parse_statement(Token *tokens, const char *raw,
+PrepareStatus parse_statement(Parser *parser, const char *raw,
                               Statement *statement);
 PrepareStatus prepare_statement(const char *in, Statement *statement);
 

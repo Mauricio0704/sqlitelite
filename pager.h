@@ -34,7 +34,7 @@ Pager *new_pager(char *filename);
 void  *get_page(Pager *pager, uint32_t page_num);
 void   flush_page(Pager *pager, uint32_t num_page);
 void   pager_mark_dirty(Pager *pager, uint32_t page_num);
-Table *new_table_from_stmt(Pager *pgr, Statement *stmt);
+Table *new_table_from_stmt(Pager *pgr, Statement *stmt, uint32_t root_page_num);
 Database *open_db(char *filename);
 void   close_db(Table *table);
 
