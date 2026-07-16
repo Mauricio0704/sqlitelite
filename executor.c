@@ -219,16 +219,29 @@ ExecuteStatus execute_statement(Statement *stmt, Database *db) {
   Table *table;
   ExecuteStatus status = analyze(stmt, db, &table);
   if (status != EXECUTE_SUCCESS) {
-    if (stmt->type == STATEMENT_SELECT)
+    switch (stmt->type) {
+    case STATEMENT_SELECT:
       free_select_stmt(stmt->select_stmt);
-    else if (stmt->type == STATEMENT_DELETE)
+      break;
+    case STATEMENT_DELETE:
       free_delete_stmt(stmt->delete_stmt);
+      break;
+    case STATEMENT_INSERT:
+      free_insert_stmt(stmt->insert_stmt);
+      break;
+    case STATEMENT_CREATE:
+      free_create_stmt(stmt->create_stmt);
+      break;
+    }
     return status;
   }
 
   switch (stmt->type) {
-  case STATEMENT_INSERT:
-    return execute_insert(stmt->insert_stmt, table);
+  case STATEMENT_INSERT: {
+    ExecuteStatus insert_status = execute_insert(stmt->insert_stmt, table);
+    free_insert_stmt(stmt->insert_stmt);
+    return insert_status;
+  }
   case STATEMENT_SELECT:
     execute_select(stmt->select_stmt, table);
     free_select_stmt(stmt->select_stmt);
@@ -245,6 +258,7 @@ ExecuteStatus execute_statement(Statement *stmt, Database *db) {
     db->tables[db->num_tables] = new_table_from_stmt(pager, stmt);
     pager->num_pages++;
     db->num_tables++;
+    free_create_stmt(stmt->create_stmt);
     break;
   }
   return EXECUTE_SUCCESS;

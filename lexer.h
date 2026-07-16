@@ -13,6 +13,7 @@
   TOKEN_KW_SELECT,
   TOKEN_KW_INSERT,
   TOKEN_KW_INTO,
+  TOKEN_KW_VALUES,
   TOKEN_KW_FROM,
   TOKEN_KW_DELETE,
   TOKEN_KW_WHERE,
@@ -34,8 +35,8 @@
 
 static const char * const token_type_names[] = {
   "CREATE", "TABLE", "PRIMARY", "KEY", "INT", "TEXT", "SELECT", "INSERT",
-  "INTO", "FROM", "DELETE", "WHERE", "AND", "OR", "(", ")", "*", "=", "<", ">",
-  "<=", ">=", ",", "IDENTIFIER", "INT_LITERAL", "EOF"
+  "INTO", "VALUES", "FROM", "DELETE", "WHERE", "AND", "OR", "(", ")", "*", "=",
+  "<", ">", "<=", ">=", ",", "IDENTIFIER", "INT_LITERAL", "EOF"
 };
 
 typedef struct {

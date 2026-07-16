@@ -36,6 +36,8 @@ Token classify_word(const char *start, size_t len) {
     return (Token){TOKEN_KW_OR, (char *)start, len};
   if (len == 1 && strncmp(start, "*", 1) == 0)
     return (Token){TOKEN_OP_ALL, (char *)start, len};
+  if (len == 6 && strncmp(start, "values", 6) == 0)
+    return (Token){TOKEN_KW_VALUES, (char *)start, len};
 
   for (size_t i = 0; i < len; i++) {
     if (!isdigit((unsigned char)start[i]))

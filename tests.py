@@ -31,7 +31,7 @@ USERS_SCHEMA = "create table users (id int primary key, name text, email text)"
 
 def ins(id, name, email):
     """Build a qualified INSERT for the users table."""
-    return f"insert into users {id} {name} {email}"
+    return f"insert into users values ({id}, {name}, {email})"
 
 
 def sel(cols="*", where=None):
@@ -65,7 +65,7 @@ def make_users_like(table):
 
 def ins_into(table, *values):
     """Positional INSERT into any table: ins_into('kv', 1, 'hello')."""
-    return f"insert into {table} " + " ".join(str(v) for v in values)
+    return f"insert into {table} values (" + ", ".join(str(v) for v in values) + ")"
 
 
 def sel_from(table, cols="*", where=None):
@@ -232,22 +232,47 @@ class TestInsertValidation(DBTestCase):
         ]))
 
     def test_too_few_values_rejected(self):
-        # Missing the email column.
-        self.assertEqual(self._run("insert into users 1 alice"), [self.GOOD])
+        # Two values for a three-column schema (missing the email column).
+        self.assertEqual(
+            self._run("insert into users values (1, alice)"), [self.GOOD]
+        )
 
     def test_no_values_rejected(self):
-        self.assertEqual(self._run("insert into users"), [self.GOOD])
+        # Empty value list: zero columns supplied for a three-column schema.
+        self.assertEqual(self._run("insert into users values ()"), [self.GOOD])
 
     def test_too_many_values_rejected(self):
         self.assertEqual(
-            self._run("insert into users 1 alice a@x.com extra"), [self.GOOD]
+            self._run("insert into users values (1, alice, a@x.com, extra)"),
+            [self.GOOD],
         )
 
     def test_wrong_type_in_pk_column_rejected(self):
-        # 'abc' is text where the id column is INT. Currently SIGBUSes, which is
-        # exactly why this test insists the good row still appears afterward.
+        # 'abc' is text where the id column is INT; the analyzer's schema check
+        # must reject it (and the good row still appears afterward).
         self.assertEqual(
-            self._run("insert into users abc alice a@x.com"), [self.GOOD]
+            self._run("insert into users values (abc, alice, a@x.com)"),
+            [self.GOOD],
+        )
+
+    # --- required VALUES (...) syntax -------------------------------------
+
+    def test_insert_without_values_keyword_rejected(self):
+        # Values supplied but the VALUES keyword is missing.
+        self.assertEqual(
+            self._run("insert into users (1, alice, a@x.com)"), [self.GOOD]
+        )
+
+    def test_insert_without_parens_rejected(self):
+        # VALUES present but the value list is not parenthesized.
+        self.assertEqual(
+            self._run("insert into users values 1, alice, a@x.com"), [self.GOOD]
+        )
+
+    def test_insert_missing_closing_paren_rejected(self):
+        # Unterminated value list: the closing ')' never arrives.
+        self.assertEqual(
+            self._run("insert into users values (1, alice, a@x.com"), [self.GOOD]
         )
 
 
@@ -445,6 +470,42 @@ class TestWhere(DBTestCase):
             self._rows(lines),
             ["(1, alice, alice@example.com)", "(3, carol, carol@example.com)"],
         )
+
+    # --- parenthesized grouping -------------------------------------------
+
+    def test_where_parens_override_precedence(self):
+        # Parens force the OR first: (id=1 OR id=3) AND name=carol -> only row 3.
+        # Without parens this is id=1 OR (id=3 AND name=carol) -> rows 1 and 3,
+        # so the bracketed form must return a strictly smaller set.
+        lines = self.run_cmds(
+            self._people()
+            + [sel("*", "(id = 1 or id = 3) and name = carol"), ".exit"]
+        )
+        self.assertEqual(self._rows(lines), ["(3, carol, carol@example.com)"])
+
+    def test_where_parens_change_result_vs_unparenthesized(self):
+        # Same predicate as test_where_and_binds_tighter_than_or, but grouped:
+        # id=1 AND (name=alice OR id=3) -> only row 1 (row 3 fails id=1).
+        lines = self.run_cmds(
+            self._people()
+            + [sel("*", "id = 1 and (name = alice or id = 3)"), ".exit"]
+        )
+        self.assertEqual(self._rows(lines), ["(1, alice, alice@example.com)"])
+
+    def test_where_parens_around_single_comparison(self):
+        lines = self.run_cmds(
+            self._people() + [sel("*", "(name = bob)"), ".exit"]
+        )
+        self.assertEqual(self._rows(lines), ["(2, bob, bob@example.com)"])
+
+    def test_where_nested_parens(self):
+        lines = self.run_cmds(self._people() + [sel("*", "((id = 2))"), ".exit"])
+        self.assertEqual(self._rows(lines), ["(2, bob, bob@example.com)"])
+
+    def test_where_unbalanced_parens_rejected(self):
+        # A missing ')' must be rejected, not silently parsed.
+        lines = self.run_cmds(self._people() + [sel("*", "(id = 1"), ".exit"])
+        self.assertEqual(self._rows(lines), [])
 
     def test_where_chained_or(self):
         lines = self.run_cmds(

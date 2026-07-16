@@ -61,6 +61,8 @@ Expr *parse_expr(Token *tokens, uint32_t *pos);
 void free_expr(Expr *expr); // recursive teardown
 void free_select_stmt(SelectStmt *stmt);
 void free_delete_stmt(DeleteStmt *stmt);
+void free_insert_stmt(InsertStmt *stmt);
+void free_create_stmt(CreateStmt *stmt);
 PrepareStatus parse_statement(Token *tokens, const char *raw,
                               Statement *statement);
 PrepareStatus prepare_statement(const char *in, Statement *statement);

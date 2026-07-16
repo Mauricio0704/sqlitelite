@@ -1,6 +1,8 @@
 #include "parser.h"
+#include "btree.h"
 #include "common.h"
 #include "lexer.h"
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -32,8 +34,37 @@ void free_delete_stmt(DeleteStmt *stmt) {
   free(stmt);
 }
 
+void free_insert_stmt(InsertStmt *stmt) {
+  free_record(&stmt->record);
+  free(stmt);
+}
+
+void free_create_stmt(CreateStmt *stmt) {
+  free(stmt->new_table_name);
+  free(stmt);
+}
+
 int is_value_token(TokenType type) {
   return type == TOKEN_IDENTIFIER || type == TOKEN_INT_LITERAL;
+}
+
+Expr *parse_comparison(Token *tokens, uint32_t *pos);
+
+/* A primary is either a parenthesized expression or a comparison. */
+Expr *parse_primary(Token *toks, uint32_t *pos) {
+  if (toks[*pos].type == TOKEN_KW_LPAREN) {
+    (*pos)++; /* consume '(' */
+    Expr *expr = parse_expr(toks, pos);
+    if (expr == NULL)
+      return NULL;
+    if (toks[*pos].type != TOKEN_KW_RPAREN) {
+      free_expr(expr);
+      return NULL;
+    }
+    (*pos)++; /* consume ')' */
+    return expr;
+  }
+  return parse_comparison(toks, pos);
 }
 
 Expr *parse_comparison(Token *tokens, uint32_t *pos) {
@@ -61,25 +92,22 @@ Expr *parse_comparison(Token *tokens, uint32_t *pos) {
   expr->col_name = strndup(col_tok.start_lexeme, col_tok.len_lexeme);
   expr->op_type = op;
 
-  if (tokens[*pos].type == TOKEN_INT_LITERAL) {
+  if (tokens[*pos].type == TOKEN_INT_LITERAL)
     expr->intval = (uint32_t)strtol(tokens[*pos].start_lexeme, NULL, 10);
-  } else {
-    expr->strval = malloc(sizeof(char) * (tokens[*pos].len_lexeme + 1));
-    memcpy(expr->strval, tokens[*pos].start_lexeme, tokens[*pos].len_lexeme);
-    expr->strval[tokens[*pos].len_lexeme] = '\0';
-  }
+  else
+    expr->strval = strndup(tokens[*pos].start_lexeme, tokens[*pos].len_lexeme);
   (*pos)++;
   return expr;
 }
 
 Expr *parse_and(Token *tokens, uint32_t *pos) {
-  Expr *left = parse_comparison(tokens, pos);
+  Expr *left = parse_primary(tokens, pos);
   if (left == NULL)
     return NULL;
 
   while (tokens[*pos].type == TOKEN_KW_AND) {
     (*pos)++; /* consume AND */
-    Expr *right = parse_comparison(tokens, pos);
+    Expr *right = parse_primary(tokens, pos);
     if (right == NULL) {
       free_expr(left);
       return NULL;
@@ -228,7 +256,8 @@ PrepareStatus parse_select(Token *toks, Statement *stmt) {
 
 PrepareStatus parse_insert(Token *toks, Statement *stmt) {
   stmt->type = STATEMENT_INSERT;
-  if (toks[1].type != TOKEN_KW_INTO || toks[2].type != TOKEN_IDENTIFIER)
+  if (toks[1].type != TOKEN_KW_INTO || toks[2].type != TOKEN_IDENTIFIER ||
+      toks[3].type != TOKEN_KW_VALUES || toks[4].type != TOKEN_KW_LPAREN)
     return PREPARE_FAILURE;
 
   stmt->table_name = strndup(toks[2].start_lexeme, toks[2].len_lexeme);
@@ -239,33 +268,41 @@ PrepareStatus parse_insert(Token *toks, Statement *stmt) {
   record->n_vals = 0;
   record->vals = malloc(sizeof(Value) * 8); /* Placeholder */
 
-  uint16_t token_idx = 3;
-  while (toks[token_idx].type != TOKEN_EOF) {
+  uint16_t token_idx = 5;
+  while (toks[token_idx].type != TOKEN_KW_RPAREN) {
     Token curr_token = toks[token_idx];
     switch (curr_token.type) {
     case TOKEN_INT_LITERAL:
       record->vals[record->n_vals].type = INT;
       record->vals[record->n_vals].int_val =
           (uint32_t)strtol(curr_token.start_lexeme, NULL, 10);
-      record->n_vals += 1;
+      record->n_vals++;
       break;
     case TOKEN_IDENTIFIER: {
       Value *curr_value = &(record->vals[record->n_vals]);
       curr_value->type = TEXT;
       curr_value->text_val.len = curr_token.len_lexeme;
-      curr_value->text_val.str = malloc(curr_value->text_val.len + 1);
-      memcpy(curr_value->text_val.str, curr_token.start_lexeme,
-             curr_token.len_lexeme);
-      curr_value->text_val.str[curr_token.len_lexeme] = '\0';
-      record->n_vals += 1;
+      curr_value->text_val.str =
+          strndup(curr_token.start_lexeme, curr_token.len_lexeme);
+      record->n_vals++;
       break;
     }
     default:
+      free_insert_stmt(stmt->insert_stmt);
+      free(stmt->table_name);
       return PREPARE_FAILURE;
     }
-    token_idx += 1;
+    token_idx++;
+    if (toks[token_idx].type != TOKEN_COMMA)
+      break;
+    token_idx++;
   }
-
+  if (toks[token_idx].type != TOKEN_KW_RPAREN ||
+      toks[token_idx + 1].type != TOKEN_EOF) {
+    free_insert_stmt(stmt->insert_stmt);
+    free(stmt->table_name);
+    return PREPARE_FAILURE;
+  }
   return PREPARE_SUCCESS;
 }
 
