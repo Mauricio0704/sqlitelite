@@ -4,7 +4,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-// Classifies a word into a token:
+/* Classifies a word into a token: */
 Token classify_word(const char *start, size_t len) {
   if (len == 6 && strncmp(start, "create", 6) == 0)
     return (Token){TOKEN_KW_CREATE, (char *)start, len};
@@ -38,6 +38,10 @@ Token classify_word(const char *start, size_t len) {
     return (Token){TOKEN_OP_ALL, (char *)start, len};
   if (len == 6 && strncmp(start, "values", 6) == 0)
     return (Token){TOKEN_KW_VALUES, (char *)start, len};
+  if (len == 6 && strncmp(start, "update", 6) == 0)
+    return (Token){TOKEN_KW_UPDATE, (char *)start, len};
+  if (len == 3 && strncmp(start, "set", 3) == 0)
+    return (Token){TOKEN_KW_SET, (char *)start, len};
 
   for (size_t i = 0; i < len; i++) {
     if (!isdigit((unsigned char)start[i]))

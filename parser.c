@@ -49,6 +49,17 @@ void free_create_stmt(CreateStmt *stmt) {
   free(stmt);
 }
 
+void free_update_stmt(UpdateStmt *stmt) {
+  if (stmt->has_where)
+    free(stmt->where_expr);
+  for (size_t i = 0; i < stmt->new_vals_count; i++) {
+    Value val = stmt->new_vals[i];
+    if (val.type == TEXT)
+      free(val.text_val.str);
+  }
+  free(stmt->new_vals);
+}
+
 int is_value_token(TokenType type) {
   return type == TOKEN_IDENTIFIER || type == TOKEN_INT_LITERAL;
 }
@@ -216,12 +227,12 @@ PrepareStatus parse_schema(Parser *parser, Schema *schema) {
   return parser->had_error ? PREPARE_FAILURE : PREPARE_SUCCESS;
 }
 
-PrepareStatus parse_create(Parser *parser, const char *raw, Statement *stmt) {
+void parse_create(Parser *parser, const char *raw, Statement *stmt) {
   consume(parser, TOKEN_KW_CREATE);
   consume(parser, TOKEN_KW_TABLE);
   Token *table_name = consume(parser, TOKEN_IDENTIFIER);
   if (parser->had_error)
-    return PREPARE_FAILURE;
+    return;
 
   stmt->type = STATEMENT_CREATE;
   stmt->table_name = strdup("catalog");
@@ -243,13 +254,10 @@ PrepareStatus parse_create(Parser *parser, const char *raw, Statement *stmt) {
   if (parser->had_error) {
     free_create_stmt(stmt->create_stmt);
     free(stmt->table_name);
-    return PREPARE_FAILURE;
   }
-
-  return PREPARE_SUCCESS;
 }
 
-PrepareStatus parse_select(Parser *parser, Statement *stmt) {
+void parse_select(Parser *parser, Statement *stmt) {
   consume(parser, TOKEN_KW_SELECT);
 
   stmt->type = STATEMENT_SELECT;
@@ -266,7 +274,7 @@ PrepareStatus parse_select(Parser *parser, Statement *stmt) {
       if (col == NULL || sel->projection_count >= MAX_SELECT_COLUMNS) {
         parser->had_error = true;
         free_select_stmt(sel);
-        return PREPARE_FAILURE;
+        return;
       }
       sel->projection_names[sel->projection_count++] =
           strndup(col->start_lexeme, col->len_lexeme);
@@ -277,18 +285,18 @@ PrepareStatus parse_select(Parser *parser, Statement *stmt) {
   Token *table = consume(parser, TOKEN_IDENTIFIER);
   if (from == NULL || table == NULL) {
     free_select_stmt(sel);
-    return PREPARE_FAILURE;
+    return;
   }
   stmt->table_name = strndup(table->start_lexeme, table->len_lexeme);
 
   /* No WHERE clause. */
   if (parser->toks[parser->pos].type == TOKEN_EOF)
-    return PREPARE_SUCCESS;
+    return;
 
   if (!match(parser, TOKEN_KW_WHERE)) {
     free_select_stmt(sel);
     free(stmt->table_name);
-    return PREPARE_FAILURE;
+    return;
   }
 
   Expr *where_expr = parse_expr(parser);
@@ -296,21 +304,37 @@ PrepareStatus parse_select(Parser *parser, Statement *stmt) {
     free_expr(where_expr);
     free_select_stmt(sel);
     free(stmt->table_name);
-    return PREPARE_FAILURE;
+    return;
   }
   sel->has_where = 1;
   sel->where_expr = where_expr;
+}
+
+PrepareStatus parse_value(Parser *parser, Value *val) {
+  Token *v = &parser->toks[parser->pos];
+  if (v->type == TOKEN_INT_LITERAL) {
+    val->type = INT;
+    val->int_val = (uint32_t)strtol(v->start_lexeme, NULL, 10);
+    parser->pos++;
+  } else if (v->type == TOKEN_IDENTIFIER) {
+    val->type = TEXT;
+    val->text_val.len = v->len_lexeme;
+    val->text_val.str = strndup(v->start_lexeme, v->len_lexeme);
+    parser->pos++;
+  } else
+    parser->had_error = true;
+
   return PREPARE_SUCCESS;
 }
 
-PrepareStatus parse_insert(Parser *parser, Statement *stmt) {
+void parse_insert(Parser *parser, Statement *stmt) {
   consume(parser, TOKEN_KW_INSERT);
   consume(parser, TOKEN_KW_INTO);
   Token *table = consume(parser, TOKEN_IDENTIFIER);
   consume(parser, TOKEN_KW_VALUES);
   consume(parser, TOKEN_KW_LPAREN);
   if (parser->had_error)
-    return PREPARE_FAILURE;
+    return;
 
   stmt->type = STATEMENT_INSERT;
   stmt->table_name = strndup(table->start_lexeme, table->len_lexeme);
@@ -327,23 +351,10 @@ PrepareStatus parse_insert(Parser *parser, Statement *stmt) {
         break;
       }
       Token *v = &parser->toks[parser->pos];
-      if (v->type == TOKEN_INT_LITERAL) {
-        record->vals[record->n_vals].type = INT;
-        record->vals[record->n_vals].int_val =
-            (uint32_t)strtol(v->start_lexeme, NULL, 10);
-        record->n_vals++;
-        parser->pos++;
-      } else if (v->type == TOKEN_IDENTIFIER) {
-        Value *curr_value = &record->vals[record->n_vals];
-        curr_value->type = TEXT;
-        curr_value->text_val.len = v->len_lexeme;
-        curr_value->text_val.str = strndup(v->start_lexeme, v->len_lexeme);
-        record->n_vals++;
-        parser->pos++;
-      } else {
-        parser->had_error = true;
+      parse_value(parser, &record->vals[record->n_vals]);
+      if (parser->had_error)
         break;
-      }
+      record->n_vals++;
     } while (match(parser, TOKEN_COMMA));
   }
 
@@ -351,18 +362,16 @@ PrepareStatus parse_insert(Parser *parser, Statement *stmt) {
       consume(parser, TOKEN_EOF) == NULL) {
     free_insert_stmt(stmt->insert_stmt);
     free(stmt->table_name);
-    return PREPARE_FAILURE;
   }
-  return PREPARE_SUCCESS;
 }
 
-PrepareStatus parse_delete(Parser *parser, Statement *stmt) {
+void parse_delete(Parser *parser, Statement *stmt) {
   consume(parser, TOKEN_KW_DELETE);
   consume(parser, TOKEN_KW_FROM);
   Token *table_name = consume(parser, TOKEN_IDENTIFIER);
   if (parser->had_error) {
     printf("Incorrect arguments for delete\n");
-    return PREPARE_FAILURE;
+    return;
   }
 
   stmt->type = STATEMENT_DELETE;
@@ -373,14 +382,15 @@ PrepareStatus parse_delete(Parser *parser, Statement *stmt) {
   if (parser->toks[parser->pos].type == TOKEN_EOF) {
     stmt->delete_stmt->has_where = 0;
     stmt->delete_stmt->where_expr = NULL;
-    return PREPARE_SUCCESS;
+    return;
   }
 
   if (!match(parser, TOKEN_KW_WHERE)) {
     printf("Incorrect arguments for delete\n");
+    parser->had_error = true;
     free(stmt->table_name);
     free(stmt->delete_stmt);
-    return PREPARE_FAILURE;
+    return;
   }
 
   Expr *where_expr = parse_expr(parser);
@@ -388,27 +398,78 @@ PrepareStatus parse_delete(Parser *parser, Statement *stmt) {
     free_expr(where_expr);
     free(stmt->table_name);
     free(stmt->delete_stmt);
-    return PREPARE_FAILURE;
+    return;
   }
   stmt->delete_stmt->has_where = 1;
   stmt->delete_stmt->where_expr = where_expr;
 
-  return PREPARE_SUCCESS;
+  return;
 }
 
-PrepareStatus parse_statement(Parser *parser, const char *raw,
+void parse_update(Parser *parser, Statement *stmt) {
+  consume(parser, TOKEN_KW_UPDATE);
+  Token *table_name = consume(parser, TOKEN_IDENTIFIER);
+  consume(parser, TOKEN_KW_SET);
+  if (parser->had_error) {
+    printf("Incorrect arguments for update\n");
+    return;
+  }
+
+  stmt->table_name = strndup(table_name->start_lexeme, table_name->len_lexeme);
+  stmt->update_stmt = malloc(sizeof(UpdateStmt));
+
+  UpdateStmt *upd = stmt->update_stmt;
+  upd->new_vals = malloc(sizeof(Value) * MAX_TABLE_COLUMNS);
+  upd->new_vals_count = 0;
+
+  do {
+    if (upd->new_vals_count >= MAX_TABLE_COLUMNS) {
+      parser->had_error = true;
+      break;
+    }
+    Token *col = consume(parser, TOKEN_IDENTIFIER);
+    if (col == NULL) {
+      parser->had_error = true;
+      free_update_stmt(upd);
+      return;
+    }
+    upd->new_vals_cols[upd->new_vals_count++] =
+        strndup(col->start_lexeme, col->len_lexeme);
+
+    consume(parser, TOKEN_OP_EQUAL);
+    if (parser->had_error) {
+      free_update_stmt(upd);
+      return;
+    }
+    Token *v = &parser->toks[parser->pos];
+    parse_value(parser, &upd->new_vals[upd->new_vals_count]);
+    if (parser->had_error)
+      break;
+    upd->new_vals_count++;
+  } while (match(parser, TOKEN_COMMA));
+}
+
+void parse_statement(Parser *parser, const char *raw,
                               Statement *stmt) {
   switch (parser->toks[parser->pos].type) {
   case TOKEN_KW_CREATE:
-    return parse_create(parser, raw, stmt);
+    parse_create(parser, raw, stmt);
+    break;
   case TOKEN_KW_SELECT:
-    return parse_select(parser, stmt);
+    parse_select(parser, stmt);
+    break;
   case TOKEN_KW_INSERT:
-    return parse_insert(parser, stmt);
+    parse_insert(parser, stmt);
+    break;
   case TOKEN_KW_DELETE:
-    return parse_delete(parser, stmt);
+    parse_delete(parser, stmt);
+    break;
+  case TOKEN_KW_UPDATE:
+    parse_update(parser, stmt);
+    break;
   default:
-    return PREPARE_UNRECOGNIZED_COMMAND;
+    parser->had_error = true;
+    break;
   }
 }
 
@@ -424,8 +485,8 @@ void debug_lexer(Token *tokens) {
 PrepareStatus prepare_statement(const char *input_buffer, Statement *stmt) {
   Token *toks = lexer(input_buffer);
   Parser parser = {.toks = toks, .pos = 0, .had_error = false};
-  PrepareStatus status = parse_statement(&parser, input_buffer, stmt);
+  parse_statement(&parser, input_buffer, stmt);
 
   free(toks);
-  return status;
+  return parser.had_error ? PREPARE_FAILURE : PREPARE_SUCCESS;
 }

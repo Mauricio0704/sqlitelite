@@ -232,6 +232,9 @@ ExecuteStatus execute_statement(Statement *stmt, Database *db) {
     case STATEMENT_CREATE:
       free_create_stmt(stmt->create_stmt);
       break;
+    case STATEMENT_UPDATE:
+      free_update_stmt(stmt->update_stmt);
+      break;
     }
     return status;
   }
@@ -255,10 +258,13 @@ ExecuteStatus execute_statement(Statement *stmt, Database *db) {
                    table); /* Adds new record to catalog table */
     Pager *pager = table->pager;
 
-    db->tables[db->num_tables] = new_table_from_stmt(pager, stmt, pager->num_pages);
+    db->tables[db->num_tables] =
+        new_table_from_stmt(pager, stmt, pager->num_pages);
     pager->num_pages++;
     db->num_tables++;
     free_create_stmt(stmt->create_stmt);
+    break;
+  case STATEMENT_UPDATE:
     break;
   }
   return EXECUTE_SUCCESS;

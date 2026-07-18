@@ -46,12 +46,21 @@ typedef struct {
 } DeleteStmt;
 
 typedef struct {
-  char *projection_names[MAX_SELECT_COLUMNS];
-  int projection_idxs[MAX_SELECT_COLUMNS];
+  char *projection_names[MAX_TABLE_COLUMNS];
+  int projection_idxs[MAX_TABLE_COLUMNS];
   size_t projection_count;
   int has_where;
   Expr *where_expr;
 } SelectStmt;
+
+typedef struct {
+  int has_where;
+  Expr *where_expr;
+  char *new_vals_cols[MAX_TABLE_COLUMNS];
+  int new_vals_idxs[MAX_TABLE_COLUMNS];
+  size_t new_vals_count;
+  Value *new_vals;
+} UpdateStmt;
 
 typedef struct {
   StatementType type;
@@ -61,6 +70,7 @@ typedef struct {
     CreateStmt *create_stmt;
     DeleteStmt *delete_stmt;
     SelectStmt *select_stmt;
+    UpdateStmt *update_stmt;
   };
 } Statement;
 
@@ -71,7 +81,8 @@ void free_select_stmt(SelectStmt *stmt);
 void free_delete_stmt(DeleteStmt *stmt);
 void free_insert_stmt(InsertStmt *stmt);
 void free_create_stmt(CreateStmt *stmt);
-PrepareStatus parse_statement(Parser *parser, const char *raw,
+void free_update_stmt(UpdateStmt *stmt);
+void parse_statement(Parser *parser, const char *raw,
                               Statement *statement);
 PrepareStatus prepare_statement(const char *in, Statement *statement);
 
