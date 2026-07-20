@@ -52,6 +52,19 @@ def dele(id):
     return f"delete from users where id = {id}"
 
 
+def upd(assignments, where=None):
+    """Build a qualified UPDATE for the users table.
+
+    upd("name = zoe")                     -> update users set name = zoe
+    upd("name = zoe, email = z@x.com")    -> ... set name = zoe, email = z@x.com
+    upd("name = zoe", "id = 2")           -> ... set name = zoe where id = 2
+    """
+    query = f"update users set {assignments}"
+    if where is not None:
+        query += f" where {where}"
+    return query
+
+
 # --- generic, table-name-parameterized builders ----------------------------
 # The helpers above are hardwired to `users`; these take an explicit table so
 # the multi-table / arbitrary-schema suites can address any table.
@@ -1420,6 +1433,167 @@ class TestCreateTableEdges(DBTestCase):
         ], create=False)
         self.assertIn("(2, later, l@x.com)", lines)
         self.assertNotIn("(1, early, e@x.com)", lines)
+
+
+# ---------------------------------------------------------------------------
+# N. UPDATE
+# ---------------------------------------------------------------------------
+
+
+class TestUpdateBasic(DBTestCase):
+    """UPDATE without a WHERE clause (updates every row) plus validation.
+
+    These assert on behaviour: rows survive with the new values, untouched
+    columns are preserved, and rejected updates leave the table unchanged.
+    """
+
+    def test_update_returns_executed(self):
+        lines = self.run_cmds([
+            ins(1, "alice", "a@x.com"),
+            upd("name = zoe"),
+            ".exit",
+        ])
+        self.assertIn("Executed", lines)
+
+    def test_update_single_column_all_rows(self):
+        lines = self.run_cmds([
+            ins(1, "alice", "a@x.com"),
+            ins(2, "bob", "b@x.com"),
+            upd("name = zoe"),
+            sel(),
+            ".exit",
+        ])
+        # Every row's name becomes zoe; ids and emails are preserved.
+        self.assertIn("(1, zoe, a@x.com)", lines)
+        self.assertIn("(2, zoe, b@x.com)", lines)
+
+    def test_update_multiple_columns(self):
+        lines = self.run_cmds([
+            ins(1, "alice", "a@x.com"),
+            upd("name = zoe, email = z@x.com"),
+            sel(),
+            ".exit",
+        ])
+        self.assertIn("(1, zoe, z@x.com)", lines)
+
+    def test_update_preserves_untouched_columns(self):
+        # Updating only name must leave id and email exactly as they were.
+        lines = self.run_cmds([
+            ins(7, "alice", "a@x.com"),
+            upd("name = zoe"),
+            sel(),
+            ".exit",
+        ])
+        self.assertIn("(7, zoe, a@x.com)", lines)
+
+    def test_update_row_count_unchanged(self):
+        # A full-table update is a rewrite, not an insert/delete: count is stable.
+        lines = self.run_cmds([
+            ins(1, "alice", "a@x.com"),
+            ins(2, "bob", "b@x.com"),
+            ins(3, "charlie", "c@x.com"),
+            upd("email = z@x.com"),
+            sel(),
+            ".exit",
+        ])
+        self.assertEqual(len(rows_of(lines)), 3)
+        self.assertEqual(ids_of(lines), [1, 2, 3])
+
+    def test_update_int_column(self):
+        # Non-PK integer column: exercises the INT overwrite path on a custom
+        # schema (the users fixture has no non-PK integer column).
+        lines = self.run_cmds([
+            "create table nums (id int primary key, qty int)",
+            ins_into("nums", 1, 10),
+            ins_into("nums", 2, 20),
+            "update nums set qty = 99",
+            sel_from("nums"),
+            ".exit",
+        ], create=False)
+        self.assertIn("(1, 99)", lines)
+        self.assertIn("(2, 99)", lines)
+
+    def test_update_persists_after_restart(self):
+        run_db([
+            USERS_SCHEMA,
+            ins(1, "alice", "a@x.com"),
+            ins(2, "bob", "b@x.com"),
+            upd("name = zoe"),
+            ".exit",
+        ], self.db)
+        lines = strip_prompts(run_db([sel(), ".exit"], self.db))
+        self.assertIn("(1, zoe, a@x.com)", lines)
+        self.assertIn("(2, zoe, b@x.com)", lines)
+
+    def test_update_empty_table_is_noop(self):
+        lines = self.run_cmds([
+            upd("name = zoe"),
+            sel(),
+            ".exit",
+        ])
+        self.assertIn("Executed", lines)
+        self.assertEqual(len(rows_of(lines)), 0)
+
+    def test_update_type_mismatch_rejected(self):
+        # name is TEXT; assigning an integer must be rejected and the row left
+        # untouched.
+        lines = self.run_cmds([
+            ins(1, "alice", "a@x.com"),
+            upd("name = 5"),
+            sel(),
+            ".exit",
+        ])
+        self.assertIn("Error: Column types do not match with schema types", lines)
+        self.assertIn("(1, alice, a@x.com)", lines)
+
+    def test_update_unknown_column_rejected(self):
+        lines = self.run_cmds([
+            ins(1, "alice", "a@x.com"),
+            upd("bogus = 5"),
+            sel(),
+            ".exit",
+        ])
+        self.assertIn("Error: Column types do not match with schema types", lines)
+        self.assertIn("(1, alice, a@x.com)", lines)
+
+    def test_update_table_not_found(self):
+        lines = self.run_cmds([
+            "update nope set name = zoe",
+            ".exit",
+        ])
+        self.assertIn("Error: Table not found", lines)
+
+
+class TestUpdateWhere(DBTestCase):
+    """UPDATE ... WHERE. WHERE parsing in parse_update is not wired up yet, so
+    the filter is currently ignored and every row is updated. These encode the
+    intended behaviour and are expected to fail until WHERE is implemented;
+    remove the decorators once it is.
+    """
+    def test_update_where_filters_single_row(self):
+        lines = self.run_cmds([
+            ins(1, "alice", "a@x.com"),
+            ins(2, "bob", "b@x.com"),
+            upd("name = zoe", "id = 2"),
+            sel(),
+            ".exit",
+        ])
+        # Only row 2 should change; row 1 must be untouched.
+        self.assertIn("(2, zoe, b@x.com)", lines)
+        self.assertIn("(1, alice, a@x.com)", lines)
+
+
+    def test_update_where_no_match_is_noop(self):
+        lines = self.run_cmds([
+            ins(1, "alice", "a@x.com"),
+            ins(2, "bob", "b@x.com"),
+            upd("name = zoe", "id = 99"),
+            sel(),
+            ".exit",
+        ])
+        # No row matches id = 99, so nothing changes.
+        self.assertIn("(1, alice, a@x.com)", lines)
+        self.assertIn("(2, bob, b@x.com)", lines)
 
 
 if __name__ == "__main__":

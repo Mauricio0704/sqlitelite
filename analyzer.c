@@ -10,7 +10,7 @@ int record_matches_schema(Record record, Schema *schema) {
   if (record.n_vals != schema->n_cols)
     return 0;
 
-  for (int i = 0; i < record.n_vals; i++) {
+  for (size_t i = 0; i < record.n_vals; i++) {
     ColumnType record_type = record.vals[i].type;
     ColumnType schema_type = schema->col_types[i];
 
@@ -23,7 +23,7 @@ int record_matches_schema(Record record, Schema *schema) {
 
 /* Finds the column named 'name' in schema, writing its index to *out. */
 int resolve_col_in_schema(const char *name, Schema *schema, int *out) {
-  for (int j = 0; j < schema->n_cols; j++) {
+  for (size_t j = 0; j < schema->n_cols; j++) {
     if (strcmp(name, schema->col_names[j]) == 0) {
       *out = j;
       return 1;
@@ -32,10 +32,9 @@ int resolve_col_in_schema(const char *name, Schema *schema, int *out) {
   return 0;
 }
 
-int columns_match_schema(SelectStmt *stmt, Schema *schema) {
-  for (int i = 0; i < stmt->projection_count; i++) {
-    if (!resolve_col_in_schema(stmt->projection_names[i], schema,
-                               &stmt->projection_idxs[i]))
+int columns_match_schema(char **names, int *idxs, int count, Schema *schema) {
+  for (int i = 0; i < count; i++) {
+    if (!resolve_col_in_schema(names[i], schema, &idxs[i]))
       return 0;
   }
   return 1;
@@ -62,36 +61,59 @@ int where_matches_schema(Expr *expr, Schema *schema) {
   return 0;
 }
 
+int values_match_column_types(UpdateStmt *upd, Schema *schema) {
+  for (size_t i = 0; i < upd->new_vals_count; i++) {
+    if (upd->new_vals[i].type != schema->col_types[upd->new_vals_idxs[i]])
+      return 0;
+  }
+  return 1;
+}
+
 ExecuteStatus analyze(Statement *stmt, Database *db, Table **out) {
   uint8_t found = 0;
-  for (int i = 0; i < db->num_tables; i++) {
+  for (uint32_t i = 0; i < db->num_tables; i++) {
     if (strcmp(db->tables[i]->table_name, stmt->table_name) == 0) {
       *out = db->tables[i];
       found = 1;
     }
   }
-  if (found == 0) {
+  if (found == 0)
     return EXECUTE_TABLE_NOT_FOUND;
-  }
+
   switch (stmt->type) {
   case STATEMENT_INSERT:
     if (record_matches_schema(stmt->insert_stmt->record, (*out)->schema) == 0)
       return EXECUTE_SCHEMA_MISMATCH;
     break;
-  case STATEMENT_SELECT:
-    if (columns_match_schema(stmt->select_stmt, (*out)->schema) == 0)
+  case STATEMENT_SELECT: {
+    SelectStmt *sel = stmt->select_stmt;
+    if (columns_match_schema(sel->projection_names, sel->projection_idxs,
+                             sel->projection_count, (*out)->schema) == 0)
       return EXECUTE_SCHEMA_MISMATCH;
     if (stmt->select_stmt->has_where &&
         where_matches_schema(stmt->select_stmt->where_expr, (*out)->schema) ==
             0)
       return EXECUTE_SCHEMA_MISMATCH;
     break;
+  }
   case STATEMENT_DELETE:
     if (stmt->delete_stmt->has_where &&
         where_matches_schema(stmt->delete_stmt->where_expr, (*out)->schema) ==
             0)
       return EXECUTE_SCHEMA_MISMATCH;
     break;
+  case STATEMENT_UPDATE: {
+    UpdateStmt *upd = stmt->update_stmt;
+    if (columns_match_schema(upd->new_vals_cols, upd->new_vals_idxs,
+                             upd->new_vals_count, (*out)->schema) == 0)
+      return EXECUTE_SCHEMA_MISMATCH;
+    if (values_match_column_types(upd, (*out)->schema) == 0)
+      return EXECUTE_SCHEMA_MISMATCH;
+    if (upd->has_where &&
+        where_matches_schema(upd->where_expr, (*out)->schema) == 0)
+      return EXECUTE_SCHEMA_MISMATCH;
+    break;
+  }
   default:
     break;
   }

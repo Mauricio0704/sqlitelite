@@ -144,6 +144,15 @@ void execute_select(SelectStmt *stmt, Table *table) {
   free(cursor);
 }
 
+void delete_keys(uint32_t *keys, uint32_t n_keys, Table *table) {
+  for (uint32_t i = 0; i < n_keys; i++) {
+    int key_exists;
+    Cursor *del_cursor = find_key_cursor(table, keys[i], &key_exists);
+    delete_record(del_cursor);
+    free(del_cursor);
+  }
+}
+
 void execute_delete(DeleteStmt *stmt, Table *table) {
   Cursor *cursor = new_cursor_start(table);
   uint32_t capacity = 16;
@@ -166,14 +175,56 @@ void execute_delete(DeleteStmt *stmt, Table *table) {
   }
   free(cursor);
 
+  delete_keys(keys, matches, table);
+  free(keys);
+}
+
+void execute_update(UpdateStmt *stmt, Table *table) {
+  Cursor *cursor = new_cursor_start(table);
+  uint32_t capacity = 16;
+  uint32_t matches = 0;
+  uint32_t *keys = malloc(sizeof(uint32_t) * capacity);
+  Record *records = malloc(sizeof(Record) * capacity);
+
+  while (!(cursor->is_end_of_table)) {
+    Record record;
+    read_deserialized_record(get_record_start(cursor), &record, table->schema);
+    if (!stmt->has_where || row_matches(stmt->where_expr, record)) {
+      if (matches == capacity) {
+        capacity *= 2;
+        keys = realloc(keys, sizeof(uint32_t) * capacity);
+        records = realloc(records, sizeof(Record) * capacity);
+      }
+      void *node = get_page(table->pager, cursor->page_num);
+      keys[matches] = leaf_node_key_at_slot(node, cursor->slot_num);
+      records[matches] = record;
+      matches++;
+    } else {
+      free_record(&record);
+    }
+    advance_cursor(cursor);
+  }
+  free(cursor);
+
+  delete_keys(keys, matches, table);
   for (uint32_t i = 0; i < matches; i++) {
-    int key_exists;
-    Cursor *del_cursor = find_key_cursor(table, keys[i], &key_exists);
-    delete_record(del_cursor);
-    free(del_cursor);
+    Record record = records[i];
+    for (size_t j = 0; j < stmt->new_vals_count; j++) {
+      int idx = stmt->new_vals_idxs[j];
+      if (record.vals[idx].type == TEXT)
+        free(record.vals[idx].text_val.str);
+      record.vals[idx] = stmt->new_vals[j];
+      if (stmt->new_vals[j].type == TEXT)
+        record.vals[idx].text_val.str = strndup(
+            stmt->new_vals[j].text_val.str, stmt->new_vals[j].text_val.len);
+    }
+    InsertStmt ins = {.record = record};
+    execute_insert(&ins, table);
+    free_record(&record);
   }
 
   free(keys);
+  free(records);
 }
 
 Record get_new_table_record(CreateStmt *stmt, uint32_t root_page_num) {
@@ -249,10 +300,12 @@ ExecuteStatus execute_statement(Statement *stmt, Database *db) {
     execute_select(stmt->select_stmt, table);
     free_select_stmt(stmt->select_stmt);
     break;
-  case STATEMENT_DELETE:
-    execute_delete(stmt->delete_stmt, table);
+  case STATEMENT_DELETE: {
+    DeleteStmt *del = stmt->delete_stmt;
+    execute_delete(del, table);
     free_delete_stmt(stmt->delete_stmt);
     break;
+  }
   case STATEMENT_CREATE:
     execute_create(stmt->create_stmt,
                    table); /* Adds new record to catalog table */
@@ -265,6 +318,8 @@ ExecuteStatus execute_statement(Statement *stmt, Database *db) {
     free_create_stmt(stmt->create_stmt);
     break;
   case STATEMENT_UPDATE:
+    execute_update(stmt->update_stmt, table);
+    free_update_stmt(stmt->update_stmt);
     break;
   }
   return EXECUTE_SUCCESS;

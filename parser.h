@@ -40,7 +40,6 @@ typedef struct {
 } CreateStmt;
 
 typedef struct {
-  uint32_t id_to_delete;
   int has_where;
   Expr *where_expr;
 } DeleteStmt;

@@ -51,13 +51,14 @@ void free_create_stmt(CreateStmt *stmt) {
 
 void free_update_stmt(UpdateStmt *stmt) {
   if (stmt->has_where)
-    free(stmt->where_expr);
+    free_expr(stmt->where_expr);
   for (size_t i = 0; i < stmt->new_vals_count; i++) {
-    Value val = stmt->new_vals[i];
-    if (val.type == TEXT)
-      free(val.text_val.str);
+    free(stmt->new_vals_cols[i]);
+    if (stmt->new_vals[i].type == TEXT)
+      free(stmt->new_vals[i].text_val.str);
   }
   free(stmt->new_vals);
+  free(stmt);
 }
 
 int is_value_token(TokenType type) {
@@ -350,7 +351,6 @@ void parse_insert(Parser *parser, Statement *stmt) {
         parser->had_error = true;
         break;
       }
-      Token *v = &parser->toks[parser->pos];
       parse_value(parser, &record->vals[record->n_vals]);
       if (parser->had_error)
         break;
@@ -402,8 +402,6 @@ void parse_delete(Parser *parser, Statement *stmt) {
   }
   stmt->delete_stmt->has_where = 1;
   stmt->delete_stmt->where_expr = where_expr;
-
-  return;
 }
 
 void parse_update(Parser *parser, Statement *stmt) {
@@ -415,38 +413,68 @@ void parse_update(Parser *parser, Statement *stmt) {
     return;
   }
 
+  stmt->type = STATEMENT_UPDATE;
   stmt->table_name = strndup(table_name->start_lexeme, table_name->len_lexeme);
   stmt->update_stmt = malloc(sizeof(UpdateStmt));
 
   UpdateStmt *upd = stmt->update_stmt;
   upd->new_vals = malloc(sizeof(Value) * MAX_TABLE_COLUMNS);
   upd->new_vals_count = 0;
+  upd->has_where = 0;
+  upd->where_expr = NULL;
 
   do {
     if (upd->new_vals_count >= MAX_TABLE_COLUMNS) {
       parser->had_error = true;
       break;
     }
+    /* Parse [col_name = new_val] */
     Token *col = consume(parser, TOKEN_IDENTIFIER);
     if (col == NULL) {
       parser->had_error = true;
       free_update_stmt(upd);
       return;
     }
-    upd->new_vals_cols[upd->new_vals_count++] =
+    upd->new_vals_cols[upd->new_vals_count] =
         strndup(col->start_lexeme, col->len_lexeme);
-
+    
     consume(parser, TOKEN_OP_EQUAL);
     if (parser->had_error) {
       free_update_stmt(upd);
       return;
     }
-    Token *v = &parser->toks[parser->pos];
+
     parse_value(parser, &upd->new_vals[upd->new_vals_count]);
     if (parser->had_error)
       break;
+
     upd->new_vals_count++;
   } while (match(parser, TOKEN_COMMA));
+
+  if (parser->toks[parser->pos].type == TOKEN_EOF) {
+    upd->has_where = 0;
+    upd->where_expr = NULL;
+    return;
+  }
+
+  if (!match(parser, TOKEN_KW_WHERE)) {
+    printf("Incorrect arguments for update\n");
+    parser->had_error = true;
+    free(stmt->table_name);
+    free(stmt->delete_stmt);
+    return;
+  }
+
+  Expr *where_expr = parse_expr(parser);
+  if (where_expr == NULL || consume(parser, TOKEN_EOF) == NULL) {
+    free_expr(where_expr);
+    free(stmt->table_name);
+    free(stmt->delete_stmt);
+    return;
+  }
+
+  stmt->delete_stmt->has_where = 1;
+  stmt->delete_stmt->where_expr = where_expr;
 }
 
 void parse_statement(Parser *parser, const char *raw,
